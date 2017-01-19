@@ -60,10 +60,11 @@ next_subflow:
 			struct mptcp_rem4 rem;
 
 			loc.addr.s_addr = inet_sk(meta_sk)->inet_saddr;
-			loc.loc4_id = 0;
+			loc.loc4_id = 1;
 			loc.low_prio = 0;
 
-			rem.addr.s_addr = inet_sk(meta_sk)->inet_daddr;
+      // 192.168.0.2
+      rem.addr.s_addr = 0x0200a8c0;
 			rem.port = inet_sk(meta_sk)->inet_dport;
 			rem.rem4_id = 0; /* Default 0 */
 
