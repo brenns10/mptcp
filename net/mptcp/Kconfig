@@ -31,6 +31,14 @@ config MPTCP_NDIFFPORTS
 	  pair of IP-addresses, modifying the source-port. You can set the number
 	  of subflows via the mptcp_ndiffports-sysctl.
 
+config MPTCP_DETOUR
+	tristate "MPTCP Detour"
+	depends on MPTCP=y
+	---help---
+	  This path-management module will create and destroy additional
+	  subflows through "detour" servers in order to use a different (and
+	  potentially better) route.
+
 config MPTCP_BINDER
 	tristate "MPTCP Binder"
 	depends on (MPTCP=y)
@@ -57,6 +65,9 @@ choice
 	config DEFAULT_DUMMY
 		bool "Default"
 
+	config DEFAULT_DETOUR
+		bool "detour" if MPTCP_DETOUR=y
+
 endchoice
 
 endif
@@ -67,6 +78,7 @@ config DEFAULT_MPTCP_PM
 	default "fullmesh" if DEFAULT_FULLMESH 
 	default "ndiffports" if DEFAULT_NDIFFPORTS
 	default "binder" if DEFAULT_BINDER
+	default "detour" if DEFAULT_DETOUR
 	default "default"
 
 menuconfig MPTCP_SCHED_ADVANCED
