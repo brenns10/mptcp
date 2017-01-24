@@ -2,6 +2,7 @@
 
 #include <net/mptcp.h>
 #include <net/mptcp_v4.h>
+#include <net/genetlink.h>
 
 struct detour_priv {
 	/* Worker struct for subflow establishment */
@@ -107,13 +108,69 @@ static struct mptcp_pm_ops detour __read_mostly = {
 	.owner = THIS_MODULE,
 };
 
+/* ------------------------------------------------------------
+   Netlink address family
+   ------------------------------------------------------------ */
+
+enum {
+	DETOUR_A_UNSPEC,
+	DETOUR_A_MSG,
+	__DETOUR_A_MAX,
+};
+#define DETOUR_A_MAX (__DETOUR_A_MAX - 1)
+
+static struct nla_policy detour_genl_policy[DETOUR_A_MAX + 1] = {
+	[DETOUR_A_MSG] = { .type = NLA_NUL_STRING },
+};
+static struct genl_family detour_genl_family = {
+	.id = GENL_ID_GENERATE,
+	.hdrsize = 0,
+	.name = "DETOUR",
+	.version = 1,
+	.maxattr = DETOUR_A_MAX,
+};
+
+static int detour_echo(struct sk_buff *skbf, struct genl_info *info)
+{
+	printk(KERN_INFO "mptcp_detour received netlink message\n");
+	return 0;
+}
+enum {
+	DETOUR_C_UNSPEC,
+	DETOUR_C_ECHO,
+	__DETOUR_C_MAX,
+};
+#define DETOUR_C_MAX (__DETOUR_C_MAX - 1)
+static struct genl_ops detour_genl_ops[] = {
+	{
+		.cmd = DETOUR_C_ECHO,
+		.flags = 0,
+		.policy = detour_genl_policy,
+		.doit = detour_echo,
+		.dumpit = NULL,
+	},
+};
+
+
+
 /* General initialization of MPTCP_PM */
 static int __init detour_register(void)
 {
+	int rc;
 	BUILD_BUG_ON(sizeof(struct detour_priv) > MPTCP_PM_SIZE);
+
+	printk(KERN_INFO "mptcp_detour initializing...");
 
 	if (mptcp_register_path_manager(&detour))
 		goto exit;
+
+	rc = genl_register_family_with_ops(&detour_genl_family,
+	                                   detour_genl_ops);
+	if (rc != 0)
+		goto exit;
+
+	printk(KERN_INFO "mptcp_detour initialized with family=%d",
+		detour_genl_family.id);
 
 	return 0;
 
