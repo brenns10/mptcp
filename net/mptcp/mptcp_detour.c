@@ -1,4 +1,5 @@
 #include <linux/module.h>
+#include <linux/in.h>
 
 #include <net/mptcp.h>
 #include <net/mptcp_v4.h>
@@ -115,12 +116,20 @@ static struct mptcp_pm_ops detour __read_mostly = {
 enum {
 	DETOUR_A_UNSPEC,
 	DETOUR_A_MSG,
+	DETOUR_A_DETOUR_IP,
+	DETOUR_A_DETOUR_PORT,
+	DETOUR_A_REMOTE_IP,
+	DETOUR_A_REMOTE_PORT,
 	__DETOUR_A_MAX,
 };
 #define DETOUR_A_MAX (__DETOUR_A_MAX - 1)
 
 static struct nla_policy detour_genl_policy[DETOUR_A_MAX + 1] = {
 	[DETOUR_A_MSG] = { .type = NLA_NUL_STRING },
+	[DETOUR_A_DETOUR_IP] = { .type = NLA_U32 },
+	[DETOUR_A_DETOUR_PORT] = { .type = NLA_U16 },
+	[DETOUR_A_REMOTE_IP] = { .type = NLA_U32 },
+	[DETOUR_A_REMOTE_PORT] = { .type = NLA_U16 },
 };
 static struct genl_family detour_genl_family = {
 	.id = GENL_ID_GENERATE,
@@ -130,7 +139,27 @@ static struct genl_family detour_genl_family = {
 	.maxattr = DETOUR_A_MAX,
 };
 
-static int detour_echo(struct sk_buff *skbf, struct genl_info *info)
+enum {
+	DETOUR_E_MISSING_ARG = 1,
+};
+
+/* Declarations for command numbers */
+enum {
+	DETOUR_C_UNSPEC,
+	DETOUR_C_ECHO,   // testing
+	DETOUR_C_ADD,    // add detour route
+	DETOUR_C_DEL,    // delete detour route
+	DETOUR_C_REQ,    // request a detour route
+	DETOUR_C_STAT,   // give stats on a detour
+	__DETOUR_C_MAX,
+};
+#define DETOUR_C_MAX (__DETOUR_C_MAX - 1)
+
+/*
+ * Callback for the DETOUR_C_ECHO command. Echo the DETOUR_A_MSG attribute to
+ * the kernel log.
+ */
+static int detour_echo(struct sk_buff *skb, struct genl_info *info)
 {
 	struct nlattr *arg = info->attrs[DETOUR_A_MSG];
 	char *message = (char*) arg + sizeof(struct nlattr);
@@ -138,18 +167,55 @@ static int detour_echo(struct sk_buff *skbf, struct genl_info *info)
 	       message);
 	return 0;
 }
-enum {
-	DETOUR_C_UNSPEC,
-	DETOUR_C_ECHO,
-	__DETOUR_C_MAX,
-};
-#define DETOUR_C_MAX (__DETOUR_C_MAX - 1)
+
+/*
+ * Stub for the ADD and DEL commands. Currently all this does is echo the
+ * arguments to the kernel log.
+ */
+static int detour_add_del_stub(struct sk_buff *skb, struct genl_info *info)
+{
+	struct in_addr *detour_ip, *remote_ip;
+	__be16 *detour_port, *remote_port;
+
+	if (!info->attrs[DETOUR_A_DETOUR_IP] ||
+	    !info->attrs[DETOUR_A_DETOUR_PORT] ||
+	    !info->attrs[DETOUR_A_REMOTE_IP] ||
+	    !info->attrs[DETOUR_A_REMOTE_PORT])
+		return -DETOUR_E_MISSING_ARG;
+
+	// The attribute data is located directly after the struct.
+	detour_ip = (struct in_addr*)(info->attrs[DETOUR_A_DETOUR_IP] + 1);
+	remote_ip = (struct in_addr*)(info->attrs[DETOUR_A_REMOTE_IP] + 1);
+	detour_port = (__be16*)(info->attrs[DETOUR_A_DETOUR_PORT] + 1);
+	remote_port = (__be16*)(info->attrs[DETOUR_A_REMOTE_PORT] + 1);
+
+	printk(KERN_INFO "mptcp DETOUR_C_%s: detour=%pI4:%u remote=%pI4:%u\n",
+	       (info->genlhdr->cmd == DETOUR_C_ADD ? "ADD" : "DEL"),
+	       detour_ip, *detour_port, remote_ip, *remote_port);
+	return 0;
+}
+
+/* Register functions for operations. */
 static struct genl_ops detour_genl_ops[] = {
 	{
 		.cmd = DETOUR_C_ECHO,
 		.flags = 0,
 		.policy = detour_genl_policy,
 		.doit = detour_echo,
+		.dumpit = NULL,
+	},
+	{
+		.cmd = DETOUR_C_ADD,
+		.flags = 0,
+		.policy = detour_genl_policy,
+		.doit = detour_add_del_stub,
+		.dumpit = NULL,
+	},
+	{
+		.cmd = DETOUR_C_DEL,
+		.flags = 0,
+		.policy = detour_genl_policy,
+		.doit = detour_add_del_stub,
 		.dumpit = NULL,
 	},
 };
@@ -165,7 +231,7 @@ static int __init detour_register(void)
 	int rc;
 	BUILD_BUG_ON(sizeof(struct detour_priv) > MPTCP_PM_SIZE);
 
-	printk(KERN_INFO "mptcp_detour initializing...");
+	printk(KERN_INFO "mptcp_detour initializing...\n");
 
 	if (mptcp_register_path_manager(&detour))
 		goto exit;
@@ -175,7 +241,7 @@ static int __init detour_register(void)
 	if (rc != 0)
 		goto exit;
 
-	printk(KERN_INFO "mptcp_detour initialized with family=%d",
+	printk(KERN_INFO "mptcp_detour initialized with family=%d\n",
 		detour_genl_family.id);
 
 	return 0;
