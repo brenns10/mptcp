@@ -132,7 +132,10 @@ static struct genl_family detour_genl_family = {
 
 static int detour_echo(struct sk_buff *skbf, struct genl_info *info)
 {
-	printk(KERN_INFO "mptcp_detour received netlink message\n");
+	struct nlattr *arg = info->attrs[DETOUR_A_MSG];
+	char *message = (char*) arg + sizeof(struct nlattr);
+	printk(KERN_INFO "mptcp netlink message: 0x%p \"%s\"\n", arg,
+	       message);
 	return 0;
 }
 enum {
@@ -151,9 +154,12 @@ static struct genl_ops detour_genl_ops[] = {
 	},
 };
 
-
-
-/* General initialization of MPTCP_PM */
+/*
+ * General initialization of detour path manager.
+ * 1. Registers the path manager struct with MPTCP.
+ * 2. Registers a General Netlink address family for communicating with a user
+ *    space daemon that discovers and requests detours.
+ */
 static int __init detour_register(void)
 {
 	int rc;
