@@ -990,8 +990,7 @@ static int mptcp_queue_skb(struct sock *sk)
 			meta_tp->rcv_nxt = TCP_SKB_CB(tmp1)->end_seq;
 			mptcp_check_rcvseq_wrap(meta_tp, old_rcv_nxt);
 
-			if ((TCP_SKB_CB(tmp1)->tcp_flags & TCPHDR_FIN) &&
-			    !mpcb->in_time_wait)
+			if (TCP_SKB_CB(tmp1)->tcp_flags & TCPHDR_FIN)
 				mptcp_fin(meta_sk);
 
 			/* Check if this fills a gap in the ofo queue */
@@ -1338,6 +1337,7 @@ void mptcp_fin(struct sock *meta_sk)
 	struct sock *sk = NULL, *sk_it;
 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct mptcp_cb *mpcb = meta_tp->mpcb;
+	unsigned char state;
 
 	mptcp_for_each_sk(mpcb, sk_it) {
 		if (tcp_sk(sk_it)->mptcp->path_index == mpcb->dfin_path_index) {
@@ -1351,10 +1351,15 @@ void mptcp_fin(struct sock *meta_sk)
 
 	inet_csk_schedule_ack(sk);
 
-	meta_sk->sk_shutdown |= RCV_SHUTDOWN;
-	sock_set_flag(meta_sk, SOCK_DONE);
+	if (!mpcb->in_time_wait) {
+		meta_sk->sk_shutdown |= RCV_SHUTDOWN;
+		sock_set_flag(meta_sk, SOCK_DONE);
+		state = meta_sk->sk_state;
+	} else {
+		state = mpcb->mptw_state;
+	}
 
-	switch (meta_sk->sk_state) {
+	switch (state) {
 	case TCP_SYN_RECV:
 	case TCP_ESTABLISHED:
 		/* Move to CLOSE_WAIT */
@@ -1434,6 +1439,16 @@ static void mptcp_xmit_retransmit_queue(struct sock *meta_sk)
 						  inet_csk(meta_sk)->icsk_rto,
 						  TCP_RTO_MAX);
 	}
+}
+
+static void mptcp_snd_una_update(struct tcp_sock *meta_tp, u32 data_ack)
+{
+	u32 delta = data_ack - meta_tp->snd_una;
+
+	u64_stats_update_begin(&meta_tp->syncp);
+	meta_tp->bytes_acked += delta;
+	u64_stats_update_end(&meta_tp->syncp);
+	meta_tp->snd_una = data_ack;
 }
 
 /* Handle the DATA_ACK */
@@ -1527,7 +1542,7 @@ static void mptcp_data_ack(struct sock *sk, const struct sk_buff *skb)
 	if (!prior_packets)
 		goto no_queue;
 
-	meta_tp->snd_una = data_ack;
+	mptcp_snd_una_update(meta_tp, data_ack);
 
 	mptcp_clean_rtx_queue(meta_sk, prior_snd_una);
 
@@ -2377,6 +2392,7 @@ fallback:
 	return 0;
 }
 
+/* Similar to tcp_should_expand_sndbuf */
 bool mptcp_should_expand_sndbuf(const struct sock *sk)
 {
 	const struct sock *sk_it;
@@ -2406,7 +2422,6 @@ bool mptcp_should_expand_sndbuf(const struct sock *sk)
 	if (sk_memory_allocated(meta_sk) >= sk_prot_mem_limits(meta_sk, 0))
 		return false;
 
-
 	/* For MPTCP we look for a subsocket that could send data.
 	 * If we found one, then we update the send-buffer.
 	 */
@@ -2422,7 +2437,7 @@ bool mptcp_should_expand_sndbuf(const struct sock *sk)
 		if (tp_it->mptcp->rcv_low_prio || tp_it->mptcp->low_prio)
 			cnt_backups++;
 
-		if (tp_it->packets_out < tp_it->snd_cwnd) {
+		if (tcp_packets_in_flight(tp_it) < tp_it->snd_cwnd) {
 			if (tp_it->mptcp->rcv_low_prio || tp_it->mptcp->low_prio) {
 				backup_available = 1;
 				continue;

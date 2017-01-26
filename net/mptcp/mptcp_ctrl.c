@@ -623,7 +623,13 @@ static void mptcp_sock_def_error_report(struct sock *sk)
 		if (!sock_flag(meta_sk, SOCK_DEAD))
 			meta_sk->sk_error_report(meta_sk);
 
-		tcp_done(meta_sk);
+		WARN(meta_sk->sk_state == TCP_CLOSE,
+		     "Meta already closed i_rcv %u i_snd %u send_i %u flags %#lx\n",
+		     mpcb->infinite_mapping_rcv, mpcb->infinite_mapping_snd,
+		     mpcb->send_infinite_mapping, meta_sk->sk_flags);
+
+		if (meta_sk->sk_state != TCP_CLOSE)
+			tcp_done(meta_sk);
 	}
 
 	sk->sk_err = 0;
@@ -728,6 +734,8 @@ static void mptcp_set_state(struct sock *sk)
 			meta_sk->sk_state_change(meta_sk);
 			sk_wake_async(meta_sk, SOCK_WAKE_IO, POLL_OUT);
 		}
+
+		tcp_sk(meta_sk)->lsndtime = tcp_time_stamp;
 	}
 
 	if (sk->sk_state == TCP_ESTABLISHED) {
@@ -987,7 +995,9 @@ int mptcp_backlog_rcv(struct sock *meta_sk, struct sk_buff *skb)
 }
 
 struct lock_class_key meta_key;
+char *meta_key_name = "sk_lock-AF_INET-MPTCP";
 struct lock_class_key meta_slock_key;
+char *meta_slock_key_name = "slock-AF_INET-MPTCP";
 
 static const struct tcp_sock_ops mptcp_meta_specific = {
 	.__select_window		= __mptcp_select_window,
@@ -1764,9 +1774,9 @@ adjudge_to_death:
 	}
 	if (meta_sk->sk_state != TCP_CLOSE) {
 		sk_mem_reclaim(meta_sk);
-		if (tcp_too_many_orphans(meta_sk, 0)) {
+		if (tcp_check_oom(meta_sk, 0)) {
 			if (net_ratelimit())
-				pr_info("MPTCP: too many of orphaned sockets\n");
+				pr_info("MPTCP: out of memory: force closing socket\n");
 			tcp_set_state(meta_sk, TCP_CLOSE);
 			meta_tp->ops->send_active_reset(meta_sk, GFP_ATOMIC);
 			NET_INC_STATS_BH(sock_net(meta_sk),
@@ -2111,7 +2121,6 @@ struct sock *mptcp_check_req_child(struct sock *meta_sk, struct sock *child,
 teardown:
 	/* Drop this request - sock creation failed. */
 	inet_csk_reqsk_queue_drop(meta_sk, req);
-	reqsk_put(req);
 	inet_csk_prepare_forced_close(child);
 	tcp_done(child);
 	return meta_sk;
@@ -2191,22 +2200,22 @@ void mptcp_twsk_destructor(struct tcp_timewait_sock *tw)
 /* Updates the rcv_nxt of the time-wait-socks and allows them to ack a
  * data-fin.
  */
-void mptcp_time_wait(struct sock *sk, int state, int timeo)
+void mptcp_time_wait(struct sock *meta_sk, int state, int timeo)
 {
-	struct tcp_sock *tp = tcp_sk(sk);
+	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
 	struct mptcp_tw *mptw;
 
 	/* Used for sockets that go into tw after the meta
 	 * (see mptcp_init_tw_sock())
 	 */
-	tp->mpcb->in_time_wait = 1;
-	tp->mpcb->mptw_state = state;
+	meta_tp->mpcb->in_time_wait = 1;
+	meta_tp->mpcb->mptw_state = state;
 
 	/* Update the time-wait-sock's information */
 	rcu_read_lock_bh();
-	list_for_each_entry_rcu(mptw, &tp->mpcb->tw_list, list) {
+	list_for_each_entry_rcu(mptw, &meta_tp->mpcb->tw_list, list) {
 		mptw->meta_tw = 1;
-		mptw->rcv_nxt = mptcp_get_rcv_nxt_64(tp);
+		mptw->rcv_nxt = mptcp_get_rcv_nxt_64(meta_tp);
 
 		/* We want to ack a DATA_FIN, but are yet in FIN_WAIT_2 -
 		 * pretend as if the DATA_FIN has already reached us, that way
@@ -2218,7 +2227,8 @@ void mptcp_time_wait(struct sock *sk, int state, int timeo)
 	}
 	rcu_read_unlock_bh();
 
-	tcp_done(sk);
+	if (meta_sk->sk_state != TCP_CLOSE)
+		tcp_done(meta_sk);
 }
 
 void mptcp_tsq_flags(struct sock *sk)
@@ -2654,7 +2664,7 @@ void __init mptcp_init(void)
 	if (mptcp_register_scheduler(&mptcp_sched_default))
 		goto register_sched_failed;
 
-	pr_info("MPTCP: Stable release v0.91");
+	pr_info("MPTCP: Stable release v0.91.2");
 
 	mptcp_init_failed = false;
 
