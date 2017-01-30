@@ -1,5 +1,7 @@
 #include <linux/module.h>
 #include <linux/in.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
 
 #include <net/mptcp.h>
 #include <net/mptcp_v4.h>
@@ -10,6 +12,17 @@ struct detour_priv {
 	struct work_struct subflow_work;
 	struct mptcp_cb *mpcb;
 };
+
+struct detour_entry {
+	struct list_head entry_list;
+	struct in_addr dip;
+	__be16 dpt;
+	struct in_addr rip;
+	__be16 rpt;
+};
+
+static LIST_HEAD(entry_list);
+DEFINE_MUTEX(entry_list_lock);
 
 static int num_subflows __read_mostly = 2;
 module_param(num_subflows, int, 0644);
@@ -115,7 +128,6 @@ static struct mptcp_pm_ops detour __read_mostly = {
 
 enum {
 	DETOUR_A_UNSPEC,
-	DETOUR_A_MSG,
 	DETOUR_A_DETOUR_IP,
 	DETOUR_A_DETOUR_PORT,
 	DETOUR_A_REMOTE_IP,
@@ -125,7 +137,6 @@ enum {
 #define DETOUR_A_MAX (__DETOUR_A_MAX - 1)
 
 static struct nla_policy detour_genl_policy[DETOUR_A_MAX + 1] = {
-	[DETOUR_A_MSG] = { .type = NLA_NUL_STRING },
 	[DETOUR_A_DETOUR_IP] = { .type = NLA_U32 },
 	[DETOUR_A_DETOUR_PORT] = { .type = NLA_U16 },
 	[DETOUR_A_REMOTE_IP] = { .type = NLA_U32 },
@@ -161,10 +172,17 @@ enum {
  */
 static int detour_echo(struct sk_buff *skb, struct genl_info *info)
 {
-	struct nlattr *arg = info->attrs[DETOUR_A_MSG];
-	char *message = (char*) arg + sizeof(struct nlattr);
-	printk(KERN_INFO "mptcp netlink message: 0x%p \"%s\"\n", arg,
-	       message);
+	struct detour_entry *entry;
+
+	printk(KERN_INFO "mptcp DETOUR_ECHO: begin\n");
+	mutex_lock_interruptible(&entry_list_lock);
+	list_for_each_entry(entry, &entry_list, entry_list) {
+		printk(KERN_INFO "mptcp DETOUR_ECHO: detour=%pI4:%u remote=%pI4:%u\n",
+		       &entry->dip, entry->dpt, &entry->rip, entry->rpt);
+	}
+	mutex_unlock(&entry_list_lock);
+	printk(KERN_INFO "mptcp DETOUR_ECHO: end\n");
+
 	return 0;
 }
 
@@ -189,9 +207,41 @@ static int detour_add_del_stub(struct sk_buff *skb, struct genl_info *info)
 	detour_port = (__be16*)(info->attrs[DETOUR_A_DETOUR_PORT] + 1);
 	remote_port = (__be16*)(info->attrs[DETOUR_A_REMOTE_PORT] + 1);
 
-	printk(KERN_INFO "mptcp DETOUR_C_%s: detour=%pI4:%u remote=%pI4:%u\n",
+	printk(KERN_INFO "mptcp DETOUR_C_%s(stub): detour=%pI4:%u remote=%pI4:%u\n",
 	       (info->genlhdr->cmd == DETOUR_C_ADD ? "ADD" : "DEL"),
 	       detour_ip, *detour_port, remote_ip, *remote_port);
+	return 0;
+}
+
+/*
+ * Function which receives netlink messages and adds detour routes to our list
+ * of available ones.
+ */
+static int detour_add(struct sk_buff *skb, struct genl_info *info)
+{
+	struct detour_entry *entry;
+
+	if (!info->attrs[DETOUR_A_DETOUR_IP] ||
+	    !info->attrs[DETOUR_A_DETOUR_PORT] ||
+	    !info->attrs[DETOUR_A_REMOTE_IP] ||
+	    !info->attrs[DETOUR_A_REMOTE_PORT])
+		return -DETOUR_E_MISSING_ARG;
+
+	entry = kmalloc(sizeof(struct detour_entry), GFP_KERNEL);
+	if (!entry)
+		return -ENOMEM;
+
+	entry->dip = *(struct in_addr*)(info->attrs[DETOUR_A_DETOUR_IP] + 1);
+	entry->rip = *(struct in_addr*)(info->attrs[DETOUR_A_REMOTE_IP] + 1);
+	entry->dpt = *(__be16*)(info->attrs[DETOUR_A_DETOUR_PORT] + 1);
+	entry->rpt = *(__be16*)(info->attrs[DETOUR_A_REMOTE_PORT] + 1);
+
+	mutex_lock_interruptible(&entry_list_lock);
+	list_add(&entry->entry_list, &entry_list);
+	mutex_unlock(&entry_list_lock);
+
+	printk(KERN_INFO "mptcp DETOUR_C_ADD: detour=%pI4:%u remote=%pI4:%u\n",
+	       &entry->dip, entry->dpt, &entry->rip, entry->rpt);
 	return 0;
 }
 
@@ -208,7 +258,7 @@ static struct genl_ops detour_genl_ops[] = {
 		.cmd = DETOUR_C_ADD,
 		.flags = 0,
 		.policy = detour_genl_policy,
-		.doit = detour_add_del_stub,
+		.doit = detour_add,
 		.dumpit = NULL,
 	},
 	{
