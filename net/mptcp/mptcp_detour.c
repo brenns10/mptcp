@@ -187,33 +187,6 @@ static int detour_echo(struct sk_buff *skb, struct genl_info *info)
 }
 
 /*
- * Stub for the ADD and DEL commands. Currently all this does is echo the
- * arguments to the kernel log.
- */
-static int detour_add_del_stub(struct sk_buff *skb, struct genl_info *info)
-{
-	struct in_addr *detour_ip, *remote_ip;
-	__be16 *detour_port, *remote_port;
-
-	if (!info->attrs[DETOUR_A_DETOUR_IP] ||
-	    !info->attrs[DETOUR_A_DETOUR_PORT] ||
-	    !info->attrs[DETOUR_A_REMOTE_IP] ||
-	    !info->attrs[DETOUR_A_REMOTE_PORT])
-		return -DETOUR_E_MISSING_ARG;
-
-	// The attribute data is located directly after the struct.
-	detour_ip = (struct in_addr*)(info->attrs[DETOUR_A_DETOUR_IP] + 1);
-	remote_ip = (struct in_addr*)(info->attrs[DETOUR_A_REMOTE_IP] + 1);
-	detour_port = (__be16*)(info->attrs[DETOUR_A_DETOUR_PORT] + 1);
-	remote_port = (__be16*)(info->attrs[DETOUR_A_REMOTE_PORT] + 1);
-
-	printk(KERN_INFO "mptcp DETOUR_C_%s(stub): detour=%pI4:%u remote=%pI4:%u\n",
-	       (info->genlhdr->cmd == DETOUR_C_ADD ? "ADD" : "DEL"),
-	       detour_ip, *detour_port, remote_ip, *remote_port);
-	return 0;
-}
-
-/*
  * Function which receives netlink messages and adds detour routes to our list
  * of available ones.
  */
@@ -240,8 +213,39 @@ static int detour_add(struct sk_buff *skb, struct genl_info *info)
 	list_add(&entry->entry_list, &entry_list);
 	mutex_unlock(&entry_list_lock);
 
-	printk(KERN_INFO "mptcp DETOUR_C_ADD: detour=%pI4:%u remote=%pI4:%u\n",
-	       &entry->dip, entry->dpt, &entry->rip, entry->rpt);
+	return 0;
+}
+
+/*
+ * Function for deleting detour routes from our list.
+ */
+static int detour_del(struct sk_buff *skb, struct genl_info *info)
+{
+	struct detour_entry *entry, *next;
+	struct in_addr *detour_ip, *remote_ip;
+	__be16 *detour_port, *remote_port;
+
+	if (!info->attrs[DETOUR_A_DETOUR_IP] ||
+	    !info->attrs[DETOUR_A_DETOUR_PORT] ||
+	    !info->attrs[DETOUR_A_REMOTE_IP] ||
+	    !info->attrs[DETOUR_A_REMOTE_PORT])
+		return -DETOUR_E_MISSING_ARG;
+
+	detour_ip = (struct in_addr*)(info->attrs[DETOUR_A_DETOUR_IP] + 1);
+	remote_ip = (struct in_addr*)(info->attrs[DETOUR_A_REMOTE_IP] + 1);
+	detour_port = (__be16*)(info->attrs[DETOUR_A_DETOUR_PORT] + 1);
+	remote_port = (__be16*)(info->attrs[DETOUR_A_REMOTE_PORT] + 1);
+
+	mutex_lock_interruptible(&entry_list_lock);
+	list_for_each_entry_safe(entry, next, &entry_list, entry_list) {
+		if (entry->dip.s_addr == detour_ip->s_addr &&
+		    entry->dpt == *detour_port &&
+		    entry->rip.s_addr == remote_ip->s_addr &&
+		    entry->rpt == *remote_port)
+			list_del(&entry->entry_list);
+	}
+	mutex_unlock(&entry_list_lock);
+
 	return 0;
 }
 
@@ -265,7 +269,7 @@ static struct genl_ops detour_genl_ops[] = {
 		.cmd = DETOUR_C_DEL,
 		.flags = 0,
 		.policy = detour_genl_policy,
-		.doit = detour_add_del_stub,
+		.doit = detour_del,
 		.dumpit = NULL,
 	},
 };
