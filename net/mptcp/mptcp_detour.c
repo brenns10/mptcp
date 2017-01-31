@@ -28,6 +28,21 @@ static int num_subflows __read_mostly = 2;
 module_param(num_subflows, int, 0644);
 MODULE_PARM_DESC(num_subflows, "choose the number of subflows per MPTCP connection");
 
+static struct detour_entry *get_matching_detour(__be32 s_addr,
+                                                __be16 port)
+{
+	struct detour_entry *entry;
+	mutex_lock(&entry_list_lock);
+	list_for_each_entry(entry, &entry_list, entry_list) {
+		if (entry->rip.s_addr == s_addr && entry->rpt == port) {
+			mutex_unlock(&entry_list_lock);
+			return entry;
+		}
+	}
+	mutex_unlock(&entry_list_lock);
+	return NULL;
+}
+
 /* Create all new subflows, by doing calls to mptcp_init_subsockets
  */
 static void create_subflow_worker(struct work_struct *work)
@@ -60,19 +75,24 @@ next_subflow:
 	if (num_subflows > iter && num_subflows > mpcb->cnt_subflows) {
 		if (meta_sk->sk_family == AF_INET ||
 		    mptcp_v6_is_v4_mapped(meta_sk)) {
-			struct mptcp_loc4 loc;
-			struct mptcp_rem4 rem;
+			struct detour_entry *detour;
+			detour = get_matching_detour(inet_sk(meta_sk)->inet_daddr,
+			                             inet_sk(meta_sk)->inet_dport);
+			if (detour) {
+				struct mptcp_loc4 loc;
+				struct mptcp_rem4 rem;
 
-			loc.addr.s_addr = inet_sk(meta_sk)->inet_saddr;
-			loc.loc4_id = 1;
-			loc.low_prio = 0;
+				loc.addr.s_addr = inet_sk(meta_sk)->inet_saddr;
+				loc.loc4_id = 1;
+				loc.low_prio = 0;
 
-			// 192.168.0.2
-			rem.addr.s_addr = 0x0200a8c0;
-			rem.port = inet_sk(meta_sk)->inet_dport;
-			rem.rem4_id = 0;
+				// hack hack hack
+				rem.addr.s_addr = detour->dip.s_addr;
+				rem.port = detour->dpt;
+				rem.rem4_id = 0;
 
-			mptcp_init4_subsockets(meta_sk, &loc, &rem);
+				mptcp_init4_subsockets(meta_sk, &loc, &rem);
+			}
 		}
 		goto next_subflow;
 	}
