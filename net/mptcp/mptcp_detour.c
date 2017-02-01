@@ -28,6 +28,51 @@ static int num_subflows __read_mostly = 2;
 module_param(num_subflows, int, 0644);
 MODULE_PARM_DESC(num_subflows, "choose the number of subflows per MPTCP connection");
 
+enum {
+	DETOUR_A_UNSPEC,
+	DETOUR_A_DETOUR_IP,
+	DETOUR_A_DETOUR_PORT,
+	DETOUR_A_REMOTE_IP,
+	DETOUR_A_REMOTE_PORT,
+	__DETOUR_A_MAX,
+};
+#define DETOUR_A_MAX (__DETOUR_A_MAX - 1)
+
+static struct nla_policy detour_genl_policy[DETOUR_A_MAX + 1] = {
+	[DETOUR_A_DETOUR_IP] = { .type = NLA_U32 },
+	[DETOUR_A_DETOUR_PORT] = { .type = NLA_U16 },
+	[DETOUR_A_REMOTE_IP] = { .type = NLA_U32 },
+	[DETOUR_A_REMOTE_PORT] = { .type = NLA_U16 },
+};
+
+static struct genl_family detour_genl_family = {
+	.id = GENL_ID_GENERATE,
+	.hdrsize = 0,
+	.name = "DETOUR",
+	.version = 1,
+	.maxattr = DETOUR_A_MAX,
+};
+
+enum {
+	DETOUR_E_MISSING_ARG = 1,
+};
+
+static struct genl_multicast_group detour_genl_group[] = {
+	{ .name="detour_req" },
+};
+
+/* Declarations for command numbers */
+enum {
+	DETOUR_C_UNSPEC,
+	DETOUR_C_ECHO,   // testing
+	DETOUR_C_ADD,    // add detour route
+	DETOUR_C_DEL,    // delete detour route
+	DETOUR_C_REQ,    // request a detour route
+	DETOUR_C_STAT,   // give stats on a detour
+	__DETOUR_C_MAX,
+};
+#define DETOUR_C_MAX (__DETOUR_C_MAX - 1)
+
 static struct detour_entry *get_matching_detour(__be32 s_addr,
                                                 __be16 port)
 {
@@ -105,11 +150,33 @@ exit:
 
 static void detour_new_session(const struct sock *meta_sk)
 {
+	struct sk_buff *buf = genlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
 	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
 	struct detour_priv *fmp = (struct detour_priv *)&mpcb->mptcp_pm[0];
 
 	INIT_WORK(&fmp->subflow_work, create_subflow_worker);
 	fmp->mpcb = mpcb;
+
+	if (buf) {
+		void *head;
+		int rc;
+		head = genlmsg_put(buf, 0, 0, &detour_genl_family, 0,
+		                   DETOUR_C_REQ);
+		if (!head)
+			goto failure;
+		rc = nla_put_be32(buf, DETOUR_A_REMOTE_IP,
+		                  inet_sk(meta_sk)->inet_daddr);
+		if (rc != 0)
+			goto failure;
+		rc = nla_put_be16(buf, DETOUR_A_REMOTE_PORT,
+		                  inet_sk(meta_sk)->inet_dport);
+		if (rc != 0)
+			goto failure;
+		genlmsg_end(buf, head);
+		genlmsg_multicast(&detour_genl_family, buf, 0, 0, 0);
+	failure:
+		kfree(buf);
+	}
 }
 
 static void detour_create_subflows(struct sock *meta_sk)
@@ -145,46 +212,6 @@ static struct mptcp_pm_ops detour __read_mostly = {
 /* ------------------------------------------------------------
    Netlink address family
    ------------------------------------------------------------ */
-
-enum {
-	DETOUR_A_UNSPEC,
-	DETOUR_A_DETOUR_IP,
-	DETOUR_A_DETOUR_PORT,
-	DETOUR_A_REMOTE_IP,
-	DETOUR_A_REMOTE_PORT,
-	__DETOUR_A_MAX,
-};
-#define DETOUR_A_MAX (__DETOUR_A_MAX - 1)
-
-static struct nla_policy detour_genl_policy[DETOUR_A_MAX + 1] = {
-	[DETOUR_A_DETOUR_IP] = { .type = NLA_U32 },
-	[DETOUR_A_DETOUR_PORT] = { .type = NLA_U16 },
-	[DETOUR_A_REMOTE_IP] = { .type = NLA_U32 },
-	[DETOUR_A_REMOTE_PORT] = { .type = NLA_U16 },
-};
-static struct genl_family detour_genl_family = {
-	.id = GENL_ID_GENERATE,
-	.hdrsize = 0,
-	.name = "DETOUR",
-	.version = 1,
-	.maxattr = DETOUR_A_MAX,
-};
-
-enum {
-	DETOUR_E_MISSING_ARG = 1,
-};
-
-/* Declarations for command numbers */
-enum {
-	DETOUR_C_UNSPEC,
-	DETOUR_C_ECHO,   // testing
-	DETOUR_C_ADD,    // add detour route
-	DETOUR_C_DEL,    // delete detour route
-	DETOUR_C_REQ,    // request a detour route
-	DETOUR_C_STAT,   // give stats on a detour
-	__DETOUR_C_MAX,
-};
-#define DETOUR_C_MAX (__DETOUR_C_MAX - 1)
 
 /*
  * Callback for the DETOUR_C_ECHO command. Echo the DETOUR_A_MSG attribute to
@@ -310,8 +337,9 @@ static int __init detour_register(void)
 	if (mptcp_register_path_manager(&detour))
 		goto exit;
 
-	rc = genl_register_family_with_ops(&detour_genl_family,
-	                                   detour_genl_ops);
+	rc = genl_register_family_with_ops_groups(&detour_genl_family,
+	                                          detour_genl_ops,
+	                                          detour_genl_group);
 	if (rc != 0)
 		goto exit;
 
