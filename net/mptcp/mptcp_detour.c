@@ -130,6 +130,7 @@ next_subflow:
 				loc.addr.s_addr = inet_sk(meta_sk)->inet_saddr;
 				loc.loc4_id = 1;
 				loc.low_prio = 0;
+				loc.if_idx = 0;
 
 				// hack hack hack
 				rem.addr.s_addr = detour->dip.s_addr;
