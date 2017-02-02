@@ -88,6 +88,39 @@ static struct detour_entry *get_matching_detour(__be32 s_addr,
 	return NULL;
 }
 
+/*
+ * Requests a detour for our new mptcp session. This sends a netlink message
+ * to whatever user-space daemons are listening, asking them to create a detour
+ * to the given IPv4 address and port.
+ */
+static void request_detour(__be32 s_addr, __be16 port)
+{
+	void *head;
+	int rc;
+	struct sk_buff *buf = genlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
+	if (!buf)
+		goto alloc_failure;
+	head = genlmsg_put(buf, 0, 0, &detour_genl_family, 0,
+	                   DETOUR_C_REQ);
+	if (!head)
+		goto failure;
+	rc = nla_put_be32(buf, DETOUR_A_REMOTE_IP, s_addr);
+	if (rc != 0)
+		goto failure;
+	rc = nla_put_be16(buf, DETOUR_A_REMOTE_PORT, port);
+	if (rc != 0)
+		goto failure;
+	genlmsg_end(buf, head);
+	genlmsg_multicast(&detour_genl_family, buf, 0, 0, 0);
+	// I don't think we need to free the sk_buff, as the network driver
+	// *should* do that for us.
+	return;
+failure:
+	kfree_skb(buf);
+alloc_failure:
+	pr_alert("mptcp: failed to create detour request\n");
+}
+
 /* Create all new subflows, by doing calls to mptcp_init_subsockets
  */
 static void create_subflow_worker(struct work_struct *work)
@@ -97,6 +130,9 @@ static void create_subflow_worker(struct work_struct *work)
 	struct mptcp_cb *mpcb = pm_priv->mpcb;
 	struct sock *meta_sk = mpcb->meta_sk;
 	int iter = 0;
+
+	request_detour(inet_sk(meta_sk)->inet_daddr,
+	               inet_sk(meta_sk)->inet_dport);
 
 next_subflow:
 	if (iter) {
@@ -149,35 +185,16 @@ exit:
 	sock_put(meta_sk);
 }
 
+/* Called when MPTCP connection is fully established.
+ * NB: called from softirq context (no sleeping)
+ */
 static void detour_new_session(const struct sock *meta_sk)
 {
-	struct sk_buff *buf = genlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
 	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
 	struct detour_priv *fmp = (struct detour_priv *)&mpcb->mptcp_pm[0];
 
 	INIT_WORK(&fmp->subflow_work, create_subflow_worker);
 	fmp->mpcb = mpcb;
-
-	if (buf) {
-		void *head;
-		int rc;
-		head = genlmsg_put(buf, 0, 0, &detour_genl_family, 0,
-		                   DETOUR_C_REQ);
-		if (!head)
-			goto failure;
-		rc = nla_put_be32(buf, DETOUR_A_REMOTE_IP,
-		                  inet_sk(meta_sk)->inet_daddr);
-		if (rc != 0)
-			goto failure;
-		rc = nla_put_be16(buf, DETOUR_A_REMOTE_PORT,
-		                  inet_sk(meta_sk)->inet_dport);
-		if (rc != 0)
-			goto failure;
-		genlmsg_end(buf, head);
-		genlmsg_multicast(&detour_genl_family, buf, 0, 0, 0);
-	failure:
-		kfree(buf);
-	}
 }
 
 static void detour_create_subflows(struct sock *meta_sk)
