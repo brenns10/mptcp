@@ -129,7 +129,7 @@ static void create_subflow_worker(struct work_struct *work)
 		work, struct detour_priv, subflow_work);
 	struct mptcp_cb *mpcb = pm_priv->mpcb;
 	struct sock *meta_sk = mpcb->meta_sk;
-	int iter = 0;
+	int iter = 0, estab = 0;
 
 	request_detour(inet_sk(meta_sk)->inet_daddr,
 	               inet_sk(meta_sk)->inet_dport);
@@ -153,7 +153,7 @@ next_subflow:
 	    !tcp_sk(mpcb->master_sk)->mptcp->fully_established)
 		goto exit;
 
-	if (num_subflows > iter && num_subflows > mpcb->cnt_subflows) {
+	if (num_subflows > estab && num_subflows > mpcb->cnt_subflows) {
 		if (meta_sk->sk_family == AF_INET ||
 		    mptcp_v6_is_v4_mapped(meta_sk)) {
 			struct detour_entry *detour;
@@ -174,6 +174,7 @@ next_subflow:
 				rem.rem4_id = 0;
 
 				mptcp_init4_subsockets(meta_sk, &loc, &rem);
+				estab++;
 			}
 		}
 		goto next_subflow;
