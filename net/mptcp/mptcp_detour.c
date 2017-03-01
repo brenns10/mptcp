@@ -1,3 +1,23 @@
+/**
+ * MPTCP Detour Path Manager
+ *
+ * Creates paths through detour points in the Internet. Allows for detours to
+ * occur through two mechanisms.
+ *
+ * The first mechanism is via NAT on a detour route. In order to set this up,
+ * we must know the end host's IP and port, so we can request that the detour
+ * create a tunnel for us. In order to do this, we have a netlink protocol which
+ * we use to request detours. A user-space daemon listens to these requests,
+ * requests NAT on some of the detour points it is aware of, and then reports
+ * them back to the kernel when they are established. The kernel then wakes up
+ * the path managers so they can establish new subflows.
+ *
+ * The second (upcoming) mechanism is via OpenVPN. In this case, the user-space
+ * daemon establishes OpenVPN connections to whatever detours it would like,
+ * and reports these connections to the kernel. When a MPTCP connection looks
+ * for a new subflow, it looks through the OpenVPN connection list and selects
+ * one adapter.
+ */
 #include <linux/module.h>
 #include <linux/in.h>
 #include <linux/list.h>
@@ -7,12 +27,36 @@
 #include <net/mptcp_v4.h>
 #include <net/genetlink.h>
 
+/**
+ * Path-manager specific data. Stored within struct mptcp_cb, so it is unique to
+ * a specific MPTCP connection.
+ * @subflow_work: used to enqueue the worker task
+ * @mpcb: theoretically, we could get this with container_of
+ * @priv_list: links all MPTCP connections using detour path_manager into a list
+ * @detour_requesed: have we advertised to user space that we want a detour?
+ */
 struct detour_priv {
-	/* Worker struct for subflow establishment */
 	struct work_struct subflow_work;
 	struct mptcp_cb *mpcb;
+	struct list_head priv_list;
+	bool detour_requested;
 };
 
+/**
+ * Priv list contains (essentially) each MPTCP connection using this path
+ * manager. This is so we can loop through each MPTCP connection and queue work
+ * when we receive a new detour advertisement. For better performance, in the
+ * future we could use a hash table to identify the affected connections.
+ */
+static LIST_HEAD(priv_list);
+DEFINE_MUTEX(priv_list_lock);
+
+/**
+ * This struct contains a detour record.
+ * @entry_list: list head for entry_list
+ * @dip, @dpt: detour ip and port (TODO IPv6 support)
+ * @rip, @rpt: remote ip and port
+ */
 struct detour_entry {
 	struct list_head entry_list;
 	struct in_addr dip;
@@ -21,13 +65,25 @@ struct detour_entry {
 	__be16 rpt;
 };
 
+/**
+ * Contains every detour entry we've received from userspace. This is a bit of
+ * a hack... we probably do not need to keep these around. Will need a mechanism
+ * to remove them, otherwise they could clog up memory.
+ */
 static LIST_HEAD(entry_list);
 DEFINE_MUTEX(entry_list_lock);
 
+/**
+ * Configurable limit for how many subflows we should allow a detoured
+ * connection to have.
+ */
 static int num_subflows __read_mostly = 2;
 module_param(num_subflows, int, 0644);
 MODULE_PARM_DESC(num_subflows, "choose the number of subflows per MPTCP connection");
 
+/**
+ * "Attributes" for our generic netlink protocol.
+ */
 enum {
 	DETOUR_A_UNSPEC,
 	DETOUR_A_DETOUR_IP,
@@ -53,15 +109,23 @@ static struct genl_family detour_genl_family = {
 	.maxattr = DETOUR_A_MAX,
 };
 
+/**
+ * Error definitions for our generic netlink family.
+ */
 enum {
 	DETOUR_E_MISSING_ARG = 1,
 };
 
+/**
+ * This is the multicast group we send our requests to.
+ */
 static struct genl_multicast_group detour_genl_group[] = {
 	{ .name="detour_req" },
 };
 
-/* Declarations for command numbers */
+/**
+ * Commands for our generic netlink protocol.
+ */
 enum {
 	DETOUR_C_UNSPEC,
 	DETOUR_C_ECHO,   // testing
@@ -73,22 +137,32 @@ enum {
 };
 #define DETOUR_C_MAX (__DETOUR_C_MAX - 1)
 
+/**
+ * Search the entry_list for a detour that matches the given IP address and
+ * port.
+ */
 static struct detour_entry *get_matching_detour(__be32 s_addr,
                                                 __be16 port)
 {
 	struct detour_entry *entry;
+	pr_debug("Finding matching detour for %pI4:%u\n", &s_addr, port);
 	mutex_lock(&entry_list_lock);
 	list_for_each_entry(entry, &entry_list, entry_list) {
+		pr_debug("Checking detour=%pI4:%u remote=%pI4:%u\n", &entry->dip,
+		         entry->rpt, &entry->rip, entry->rpt);
 		if (entry->rip.s_addr == s_addr && entry->rpt == port) {
 			mutex_unlock(&entry_list_lock);
+			pr_debug("yes\n");
+			// TODO move to end of list
 			return entry;
 		}
+		pr_debug("no\n");
 	}
 	mutex_unlock(&entry_list_lock);
 	return NULL;
 }
 
-/*
+/**
  * Requests a detour for our new mptcp session. This sends a netlink message
  * to whatever user-space daemons are listening, asking them to create a detour
  * to the given IPv4 address and port.
@@ -98,6 +172,7 @@ static void request_detour(__be32 s_addr, __be16 port)
 	void *head;
 	int rc;
 	struct sk_buff *buf = genlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
+	pr_debug("request_detour()\n");
 	if (!buf)
 		goto alloc_failure;
 	head = genlmsg_put(buf, 0, 0, &detour_genl_family, 0,
@@ -121,18 +196,25 @@ alloc_failure:
 	pr_alert("mptcp: failed to create detour request\n");
 }
 
-/* Create all new subflows, by doing calls to mptcp_init_subsockets
+/**
+ * This function is the *main* routine for the detour worker. It is the task
+ * that is enqueued into the MPTCP work queue. *Heavily* based on the ndiffports
+ * create_subflow_worker.
  */
 static void create_subflow_worker(struct work_struct *work)
 {
-	const struct detour_priv *pm_priv = container_of(
+	struct detour_priv *pm_priv = container_of(
 		work, struct detour_priv, subflow_work);
 	struct mptcp_cb *mpcb = pm_priv->mpcb;
 	struct sock *meta_sk = mpcb->meta_sk;
-	int iter = 0, estab = 0;
+	int iter = 0;
+	pr_debug("detour create_subflow_worker() begins\n");
 
-	request_detour(inet_sk(meta_sk)->inet_daddr,
-	               inet_sk(meta_sk)->inet_dport);
+	if (!pm_priv->detour_requested) {
+		request_detour(inet_sk(meta_sk)->inet_daddr,
+		               inet_sk(meta_sk)->inet_dport);
+		pm_priv->detour_requested = true;
+	}
 
 next_subflow:
 	if (iter) {
@@ -146,14 +228,16 @@ next_subflow:
 
 	iter++;
 
-	if (sock_flag(meta_sk, SOCK_DEAD))
+	if (sock_flag(meta_sk, SOCK_DEAD)) {
+		list_del(&pm_priv->priv_list);
 		goto exit;
+	}
 
 	if (mpcb->master_sk &&
 	    !tcp_sk(mpcb->master_sk)->mptcp->fully_established)
 		goto exit;
 
-	if (num_subflows > estab && num_subflows > mpcb->cnt_subflows) {
+	if (num_subflows > iter && num_subflows > mpcb->cnt_subflows) {
 		if (meta_sk->sk_family == AF_INET ||
 		    mptcp_v6_is_v4_mapped(meta_sk)) {
 			struct detour_entry *detour;
@@ -174,7 +258,6 @@ next_subflow:
 				rem.rem4_id = 0;
 
 				mptcp_init4_subsockets(meta_sk, &loc, &rem);
-				estab++;
 			}
 		}
 		goto next_subflow;
@@ -184,6 +267,7 @@ exit:
 	release_sock(meta_sk);
 	mutex_unlock(&mpcb->mpcb_mutex);
 	sock_put(meta_sk);
+	pr_debug("detour create_subflow_worker() ends\n");
 }
 
 /* Called when MPTCP connection is fully established.
@@ -196,6 +280,8 @@ static void detour_new_session(const struct sock *meta_sk)
 
 	INIT_WORK(&fmp->subflow_work, create_subflow_worker);
 	fmp->mpcb = mpcb;
+	fmp->detour_requested = false; // we will do this soon
+	list_add(&fmp->priv_list, &priv_list);
 }
 
 static void detour_create_subflows(struct sock *meta_sk)
@@ -218,6 +304,8 @@ static int detour_get_local_id(sa_family_t family, union inet_addr *addr,
                                struct net *net, bool *low_prio)
 {
 	return 0;
+	// TODO return an appropriate id for each detour
+	// seems important...
 }
 
 static struct mptcp_pm_ops detour __read_mostly = {
@@ -259,6 +347,7 @@ static int detour_echo(struct sk_buff *skb, struct genl_info *info)
 static int detour_add(struct sk_buff *skb, struct genl_info *info)
 {
 	struct detour_entry *entry;
+	struct detour_priv *priv;
 
 	if (!info->attrs[DETOUR_A_DETOUR_IP] ||
 	    !info->attrs[DETOUR_A_DETOUR_PORT] ||
@@ -275,9 +364,20 @@ static int detour_add(struct sk_buff *skb, struct genl_info *info)
 	entry->dpt = *(__be16*)(info->attrs[DETOUR_A_DETOUR_PORT] + 1);
 	entry->rpt = *(__be16*)(info->attrs[DETOUR_A_REMOTE_PORT] + 1);
 
+	pr_debug("Adding a detour to the entry list.\n");
 	mutex_lock_interruptible(&entry_list_lock);
 	list_add(&entry->entry_list, &entry_list);
 	mutex_unlock(&entry_list_lock);
+
+	mutex_lock_interruptible(&priv_list_lock);
+	list_for_each_entry(priv, &priv_list, priv_list) {
+		// TODO check whether detour applies, THEN wake
+		if (!work_pending(&priv->subflow_work)) {
+			sock_hold(priv->mpcb->meta_sk);
+			queue_work(mptcp_wq, &priv->subflow_work);
+		}
+	}
+	mutex_unlock(&priv_list_lock);
 
 	return 0;
 }
