@@ -40,6 +40,7 @@ struct detour_priv {
 	struct mptcp_cb *mpcb;
 	struct list_head priv_list;
 	bool detour_requested;
+	int next_id;
 };
 
 /**
@@ -74,6 +75,22 @@ static LIST_HEAD(entry_list);
 DEFINE_MUTEX(entry_list_lock);
 
 /**
+ * This struct contains a VPN record. It's quite simple really.
+ * @vpn_list: list head for vpn_list
+ * @ifname: name of interface (resolved at runtime)
+ */
+struct vpn_entry {
+	struct list_head vpn_list;
+	char ifname[IFNAMSIZ];
+};
+
+/**
+ * Again, this contains every vpn entry we've received from userspace.
+ */
+static LIST_HEAD(vpn_list);
+DEFINE_MUTEX(vpn_list_lock);
+
+/**
  * Configurable limit for how many subflows we should allow a detoured
  * connection to have.
  */
@@ -90,6 +107,7 @@ enum {
 	DETOUR_A_DETOUR_PORT,
 	DETOUR_A_REMOTE_IP,
 	DETOUR_A_REMOTE_PORT,
+	DETOUR_A_IFNAME,
 	__DETOUR_A_MAX,
 };
 #define DETOUR_A_MAX (__DETOUR_A_MAX - 1)
@@ -99,6 +117,7 @@ static struct nla_policy detour_genl_policy[DETOUR_A_MAX + 1] = {
 	[DETOUR_A_DETOUR_PORT] = { .type = NLA_U16 },
 	[DETOUR_A_REMOTE_IP] = { .type = NLA_U32 },
 	[DETOUR_A_REMOTE_PORT] = { .type = NLA_U16 },
+	[DETOUR_A_IFNAME] = { .type = NLA_STRING, .len=IFNAMSIZ },
 };
 
 static struct genl_family detour_genl_family = {
@@ -161,6 +180,39 @@ static struct detour_entry *get_matching_detour(__be32 s_addr,
 	mutex_unlock(&entry_list_lock);
 	return NULL;
 }
+
+/**
+ * Choose a VPN to use. Right now, this simply takes the vpn from the list and
+ * moves it to the end, and then returns it. That way we're always rotating
+ * through vpns. Returns NULL if we have no vpn.
+ */
+static int choose_vpn(struct sock *meta_sk)
+{
+	struct vpn_entry *vpn;
+	struct net_device *netdev;
+	mutex_lock(&vpn_list_lock);
+	if (list_empty(&vpn_list)) {
+		mutex_unlock(&vpn_list_lock);
+		return -1;
+	}
+	list_for_each_entry(vpn, &vpn_list, vpn_list) {
+		pr_debug("Searching for vpn iface=%s in netns...\n",
+		         vpn->ifname);
+		netdev = dev_get_by_name(meta_sk->sk_net.net, vpn->ifname);
+		if (netdev) {
+			int ret = netdev->ifindex;
+			dev_put(netdev);
+			return ret;
+		}
+	}
+	mutex_unlock(&vpn_list_lock);
+
+	return -1;
+}
+
+/**
+ * Take an interface name and look up its if_idx.
+ */
 
 /**
  * Requests a detour for our new mptcp session. This sends a netlink message
@@ -241,6 +293,24 @@ next_subflow:
 		if (meta_sk->sk_family == AF_INET ||
 		    mptcp_v6_is_v4_mapped(meta_sk)) {
 			struct detour_entry *detour;
+			int vpn_if_idx = choose_vpn(meta_sk);
+			if (vpn_if_idx != -1) {
+				struct mptcp_loc4 loc;
+				struct mptcp_rem4 rem;
+
+				loc.addr.s_addr = inet_sk(meta_sk)->inet_saddr;
+				loc.loc4_id = pm_priv->next_id++;
+				loc.low_prio = 0;
+				loc.if_idx = vpn_if_idx;
+
+				rem.addr.s_addr = inet_sk(meta_sk)->inet_daddr;
+				rem.port = inet_sk(meta_sk)->inet_dport;
+				rem.rem4_id = 0;
+
+				mptcp_init4_subsockets(meta_sk, &loc, &rem);
+				goto next_subflow; // skip nat detour
+			}
+
 			detour = get_matching_detour(inet_sk(meta_sk)->inet_daddr,
 			                             inet_sk(meta_sk)->inet_dport);
 			if (detour) {
@@ -248,7 +318,7 @@ next_subflow:
 				struct mptcp_rem4 rem;
 
 				loc.addr.s_addr = inet_sk(meta_sk)->inet_saddr;
-				loc.loc4_id = 1;
+				loc.loc4_id = pm_priv->next_id++;
 				loc.low_prio = 0;
 				loc.if_idx = 0;
 
@@ -281,6 +351,7 @@ static void detour_new_session(const struct sock *meta_sk)
 	INIT_WORK(&fmp->subflow_work, create_subflow_worker);
 	fmp->mpcb = mpcb;
 	fmp->detour_requested = false; // we will do this soon
+	fmp->next_id = 1;
 	list_add(&fmp->priv_list, &priv_list);
 }
 
@@ -323,18 +394,26 @@ static struct mptcp_pm_ops detour __read_mostly = {
 /*
  * Callback for the DETOUR_C_ECHO command. Echo the DETOUR_A_MSG attribute to
  * the kernel log.
+ * TODO: this would be better represented by a seq file
  */
 static int detour_echo(struct sk_buff *skb, struct genl_info *info)
 {
 	struct detour_entry *entry;
+	struct vpn_entry *vpn;
 
 	printk(KERN_INFO "mptcp DETOUR_ECHO: begin\n");
-	mutex_lock_interruptible(&entry_list_lock);
+	mutex_lock(&entry_list_lock);
 	list_for_each_entry(entry, &entry_list, entry_list) {
 		printk(KERN_INFO "mptcp DETOUR_ECHO: detour=%pI4:%u remote=%pI4:%u\n",
 		       &entry->dip, entry->dpt, &entry->rip, entry->rpt);
 	}
 	mutex_unlock(&entry_list_lock);
+	mutex_lock(&vpn_list_lock);
+	list_for_each_entry(vpn, &vpn_list, vpn_list) {
+		printk(KERN_INFO "mptcp DETOUR_ECHO: vpn ifname=%s\n",
+		       vpn->ifname);
+	}
+	mutex_unlock(&vpn_list_lock);
 	printk(KERN_INFO "mptcp DETOUR_ECHO: end\n");
 
 	return 0;
@@ -347,29 +426,43 @@ static int detour_echo(struct sk_buff *skb, struct genl_info *info)
 static int detour_add(struct sk_buff *skb, struct genl_info *info)
 {
 	struct detour_entry *entry;
+	struct vpn_entry *vpn;
 	struct detour_priv *priv;
 
-	if (!info->attrs[DETOUR_A_DETOUR_IP] ||
-	    !info->attrs[DETOUR_A_DETOUR_PORT] ||
-	    !info->attrs[DETOUR_A_REMOTE_IP] ||
-	    !info->attrs[DETOUR_A_REMOTE_PORT])
+	if (info->attrs[DETOUR_A_IFNAME]) {
+		vpn = kmalloc(sizeof(struct vpn_entry), GFP_KERNEL);
+		if (!vpn)
+			return -ENOMEM;
+
+		nla_strlcpy(vpn->ifname, info->attrs[DETOUR_A_IFNAME], IFNAMSIZ);
+
+		pr_debug("Adding a vpn to the entry list.\n");
+		mutex_lock(&vpn_list_lock);
+		list_add(&vpn->vpn_list, &vpn_list);
+		mutex_unlock(&vpn_list_lock);
+	} else if (info->attrs[DETOUR_A_DETOUR_IP] &&
+	           info->attrs[DETOUR_A_DETOUR_PORT] &&
+	           info->attrs[DETOUR_A_REMOTE_IP] &&
+	           info->attrs[DETOUR_A_REMOTE_PORT]) {
+
+		entry = kmalloc(sizeof(struct detour_entry), GFP_KERNEL);
+		if (!entry)
+			return -ENOMEM;
+
+		entry->dip.s_addr = nla_get_in_addr(info->attrs[DETOUR_A_DETOUR_IP]);
+		entry->rip.s_addr = nla_get_in_addr(info->attrs[DETOUR_A_REMOTE_IP]);
+		entry->dpt = nla_get_be16(info->attrs[DETOUR_A_DETOUR_PORT]);
+		entry->rpt = nla_get_be16(info->attrs[DETOUR_A_REMOTE_PORT]);
+
+		pr_debug("Adding a detour to the entry list.\n");
+		mutex_lock(&entry_list_lock);
+		list_add(&entry->entry_list, &entry_list);
+		mutex_unlock(&entry_list_lock);
+	} else {
 		return -DETOUR_E_MISSING_ARG;
+	}
 
-	entry = kmalloc(sizeof(struct detour_entry), GFP_KERNEL);
-	if (!entry)
-		return -ENOMEM;
-
-	entry->dip = *(struct in_addr*)(info->attrs[DETOUR_A_DETOUR_IP] + 1);
-	entry->rip = *(struct in_addr*)(info->attrs[DETOUR_A_REMOTE_IP] + 1);
-	entry->dpt = *(__be16*)(info->attrs[DETOUR_A_DETOUR_PORT] + 1);
-	entry->rpt = *(__be16*)(info->attrs[DETOUR_A_REMOTE_PORT] + 1);
-
-	pr_debug("Adding a detour to the entry list.\n");
-	mutex_lock_interruptible(&entry_list_lock);
-	list_add(&entry->entry_list, &entry_list);
-	mutex_unlock(&entry_list_lock);
-
-	mutex_lock_interruptible(&priv_list_lock);
+	mutex_lock(&priv_list_lock);
 	list_for_each_entry(priv, &priv_list, priv_list) {
 		// TODO check whether detour applies, THEN wake
 		if (!work_pending(&priv->subflow_work)) {
@@ -387,30 +480,43 @@ static int detour_add(struct sk_buff *skb, struct genl_info *info)
  */
 static int detour_del(struct sk_buff *skb, struct genl_info *info)
 {
-	struct detour_entry *entry, *next;
-	struct in_addr *detour_ip, *remote_ip;
-	__be16 *detour_port, *remote_port;
+	if (info->attrs[DETOUR_A_IFNAME]) {
+		struct vpn_entry *entry, *next;
 
-	if (!info->attrs[DETOUR_A_DETOUR_IP] ||
-	    !info->attrs[DETOUR_A_DETOUR_PORT] ||
-	    !info->attrs[DETOUR_A_REMOTE_IP] ||
-	    !info->attrs[DETOUR_A_REMOTE_PORT])
+		mutex_lock(&vpn_list_lock);
+		list_for_each_entry_safe(entry, next, &vpn_list, vpn_list) {
+			if (nla_strcmp(info->attrs[DETOUR_A_IFNAME], entry->ifname) == 0) {
+				list_del(&entry->vpn_list);
+			}
+		}
+		mutex_unlock(&vpn_list_lock);
+	} else if (info->attrs[DETOUR_A_DETOUR_IP] &&
+	           info->attrs[DETOUR_A_DETOUR_PORT] &&
+	           info->attrs[DETOUR_A_REMOTE_IP] &&
+	           info->attrs[DETOUR_A_REMOTE_PORT]){
+		struct detour_entry *entry, *next;
+		struct in_addr detour_ip, remote_ip;
+		__be16 detour_port, remote_port;
+
+		detour_ip.s_addr = nla_get_in_addr(info->attrs[DETOUR_A_DETOUR_IP]);
+		remote_ip.s_addr = nla_get_in_addr(info->attrs[DETOUR_A_REMOTE_IP]);
+		detour_port = nla_get_be16(info->attrs[DETOUR_A_DETOUR_PORT]);
+		remote_port = nla_get_be16(info->attrs[DETOUR_A_REMOTE_PORT]);
+
+		mutex_lock(&entry_list_lock);
+		list_for_each_entry_safe(entry, next, &entry_list, entry_list) {
+			if (entry->dip.s_addr == detour_ip.s_addr &&
+			    entry->dpt == detour_port &&
+			    entry->rip.s_addr == remote_ip.s_addr &&
+			    entry->rpt == remote_port)
+				list_del(&entry->entry_list);
+		}
+		mutex_unlock(&entry_list_lock);
+
+
+	} else {
 		return -DETOUR_E_MISSING_ARG;
-
-	detour_ip = (struct in_addr*)(info->attrs[DETOUR_A_DETOUR_IP] + 1);
-	remote_ip = (struct in_addr*)(info->attrs[DETOUR_A_REMOTE_IP] + 1);
-	detour_port = (__be16*)(info->attrs[DETOUR_A_DETOUR_PORT] + 1);
-	remote_port = (__be16*)(info->attrs[DETOUR_A_REMOTE_PORT] + 1);
-
-	mutex_lock_interruptible(&entry_list_lock);
-	list_for_each_entry_safe(entry, next, &entry_list, entry_list) {
-		if (entry->dip.s_addr == detour_ip->s_addr &&
-		    entry->dpt == *detour_port &&
-		    entry->rip.s_addr == remote_ip->s_addr &&
-		    entry->rpt == *remote_port)
-			list_del(&entry->entry_list);
 	}
-	mutex_unlock(&entry_list_lock);
 
 	return 0;
 }
