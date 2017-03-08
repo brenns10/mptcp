@@ -198,7 +198,7 @@ static int choose_vpn(struct sock *meta_sk)
 	list_for_each_entry(vpn, &vpn_list, vpn_list) {
 		pr_debug("Searching for vpn iface=%s in netns...\n",
 		         vpn->ifname);
-		netdev = dev_get_by_name(meta_sk->sk_net.net, vpn->ifname);
+		netdev = dev_get_by_name(sock_net(meta_sk), vpn->ifname);
 		if (netdev) {
 			int ret = netdev->ifindex;
 			dev_put(netdev);
@@ -436,7 +436,7 @@ static int detour_add(struct sk_buff *skb, struct genl_info *info)
 
 		nla_strlcpy(vpn->ifname, info->attrs[DETOUR_A_IFNAME], IFNAMSIZ);
 
-		pr_debug("Adding a vpn to the entry list.\n");
+		pr_debug("Adding \"%s\" to the entry list.\n", vpn->ifname);
 		mutex_lock(&vpn_list_lock);
 		list_add(&vpn->vpn_list, &vpn_list);
 		mutex_unlock(&vpn_list_lock);
