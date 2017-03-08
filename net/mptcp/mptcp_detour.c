@@ -186,28 +186,29 @@ static struct detour_entry *get_matching_detour(__be32 s_addr,
  * moves it to the end, and then returns it. That way we're always rotating
  * through vpns. Returns NULL if we have no vpn.
  */
-static int choose_vpn(struct sock *meta_sk)
+static struct net_device *choose_vpn(struct sock *meta_sk)
 {
 	struct vpn_entry *vpn;
 	struct net_device *netdev;
 	mutex_lock(&vpn_list_lock);
 	if (list_empty(&vpn_list)) {
 		mutex_unlock(&vpn_list_lock);
-		return -1;
+		return NULL;
 	}
 	list_for_each_entry(vpn, &vpn_list, vpn_list) {
 		pr_debug("Searching for vpn iface=%s in netns...\n",
 		         vpn->ifname);
 		netdev = dev_get_by_name(sock_net(meta_sk), vpn->ifname);
 		if (netdev) {
-			int ret = netdev->ifindex;
+			pr_debug("found vpn iface=%s with ifindex=%d\n",
+			         vpn->ifname, netdev->ifindex);
 			dev_put(netdev);
-			return ret;
+			return netdev;
 		}
 	}
 	mutex_unlock(&vpn_list_lock);
 
-	return -1;
+	return NULL;
 }
 
 /**
@@ -293,15 +294,20 @@ next_subflow:
 		if (meta_sk->sk_family == AF_INET ||
 		    mptcp_v6_is_v4_mapped(meta_sk)) {
 			struct detour_entry *detour;
-			int vpn_if_idx = choose_vpn(meta_sk);
-			if (vpn_if_idx != -1) {
+			struct net_device *dev = choose_vpn(meta_sk);
+			if (dev) {
 				struct mptcp_loc4 loc;
 				struct mptcp_rem4 rem;
 
-				loc.addr.s_addr = inet_sk(meta_sk)->inet_saddr;
+				// this selects the appropriate source address
+				// for our net_device
+				loc.addr.s_addr = inet_select_addr(
+					dev, inet_sk(meta_sk)->inet_daddr,
+					RT_SCOPE_UNIVERSE);
+				pr_debug("selected addr=%pI4\n", &loc.addr.s_addr);
 				loc.loc4_id = pm_priv->next_id++;
 				loc.low_prio = 0;
-				loc.if_idx = vpn_if_idx;
+				loc.if_idx = dev->ifindex;
 
 				rem.addr.s_addr = inet_sk(meta_sk)->inet_daddr;
 				rem.port = inet_sk(meta_sk)->inet_dport;
