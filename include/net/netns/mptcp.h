@@ -34,6 +34,7 @@
 
 enum {
 	MPTCP_PM_FULLMESH = 0,
+	MPTCP_PM_DETOUR,
 	MPTCP_PM_MAX
 };
 
