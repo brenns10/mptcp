@@ -581,8 +581,10 @@ static int mptcp_detour_init_net(struct net *net)
 
 	mutex_init(&ns->entry_list_lock);
 	mutex_init(&ns->priv_list_lock);
+	mutex_init(&ns->vpn_list_lock);
 	INIT_LIST_HEAD(&ns->entry_list);
 	INIT_LIST_HEAD(&ns->priv_list);
+	INIT_LIST_HEAD(&ns->vpn_list);
 
 	net->mptcp.path_managers[MPTCP_PM_DETOUR] = ns;
 
