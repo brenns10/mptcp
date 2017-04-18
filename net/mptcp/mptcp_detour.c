@@ -32,19 +32,18 @@
  * a specific MPTCP connection.
  * @subflow_work: used to enqueue the worker task
  * @mpcb: theoretically, we could get this with container_of
- * @priv_list: links all MPTCP connections using detour path_manager into a list
  * @detour_requesed: have we advertised to user space that we want a detour?
+ * @next_id: the id we will use for the next address
  */
 struct detour_priv {
 	struct work_struct subflow_work;
 	struct mptcp_cb *mpcb;
-	struct list_head priv_list;
 	bool detour_requested;
 	int next_id;
 };
 
 /**
- * This struct contains a detour record.
+ * This struct contains a NAT detour record.
  * @entry_list: list head for entry_list
  * @dip, @dpt: detour ip and port (TODO IPv6 support)
  * @rip, @rpt: remote ip and port
@@ -77,8 +76,6 @@ struct vpn_entry {
  * @vpn_list_lock: protects the above list
  */
 struct detour_ns {
-	struct list_head priv_list;
-	spinlock_t priv_list_lock;
 	struct list_head entry_list;
 	struct mutex entry_list_lock;
 	struct list_head vpn_list;
@@ -286,13 +283,8 @@ next_subflow:
 
 	iter++;
 
-	if (sock_flag(meta_sk, SOCK_DEAD)) {
-		pr_debug("mptcp detour: socket dead, remove from priv list\n");
-		spin_lock(&detour_ns->priv_list_lock);
-		list_del(&pm_priv->priv_list);
-		spin_unlock(&detour_ns->priv_list_lock);
+	if (sock_flag(meta_sk, SOCK_DEAD))
 		goto exit;
-	}
 
 	if (mpcb->master_sk &&
 	    !tcp_sk(mpcb->master_sk)->mptcp->fully_established)
@@ -385,10 +377,6 @@ static void detour_create_subflows(struct sock *meta_sk)
 		sock_hold(meta_sk);
 		queue_work(mptcp_wq, &pm_priv->subflow_work);
 	}
-
-	spin_lock(&detour_ns->priv_list_lock);
-	list_add(&pm_priv->priv_list, &detour_ns->priv_list);
-	spin_unlock(&detour_ns->priv_list_lock);
 }
 
 static int detour_get_local_id(sa_family_t family, union inet_addr *addr,
@@ -438,13 +426,6 @@ static int detour_echo(struct sk_buff *skb, struct genl_info *info)
 		         vpn->ifname);
 	}
 	mutex_unlock(&ns->vpn_list_lock);
-	spin_lock(&ns->priv_list_lock);
-	list_for_each_entry(priv, &ns->priv_list, priv_list) {
-		pr_debug("mptcp DETOUR_ECHO: priv pending=%d dead=%d\n",
-		         work_pending(&priv->subflow_work),
-		         sock_flag(priv->mpcb->meta_sk, SOCK_DEAD));
-	}
-	spin_unlock(&ns->priv_list_lock);
 	pr_debug("mptcp DETOUR_ECHO: end\n");
 
 	return 0;
@@ -495,16 +476,10 @@ static int detour_add(struct sk_buff *skb, struct genl_info *info)
 		return -DETOUR_E_MISSING_ARG;
 	}
 
-	spin_lock(&ns->priv_list_lock);
-	list_for_each_entry(priv, &ns->priv_list, priv_list) {
-		// TODO check whether detour applies, THEN wake
-		if (!work_pending(&priv->subflow_work)) {
-			sock_hold(priv->mpcb->meta_sk);
-			queue_work(mptcp_wq, &priv->subflow_work);
-		}
-	}
-	spin_unlock(&ns->priv_list_lock);
-
+	// TODO: (next commit), rather than wake every queue, simply iterate
+	// over every MPTCP socket in the netns and apply it to all that can use
+	// it. This is a heavy operation, but in the system call context, the
+	// processes should be aware that this could happen.
 	return 0;
 }
 
@@ -595,10 +570,8 @@ static int mptcp_detour_init_net(struct net *net)
 		return -ENOBUFS;
 
 	mutex_init(&ns->entry_list_lock);
-	spin_lock_init(&ns->priv_list_lock);
 	mutex_init(&ns->vpn_list_lock);
 	INIT_LIST_HEAD(&ns->entry_list);
-	INIT_LIST_HEAD(&ns->priv_list);
 	INIT_LIST_HEAD(&ns->vpn_list);
 
 	net->mptcp.path_managers[MPTCP_PM_DETOUR] = ns;
