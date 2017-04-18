@@ -12,11 +12,11 @@
  * them back to the kernel when they are established. The kernel then wakes up
  * the path managers so they can establish new subflows.
  *
- * The second (upcoming) mechanism is via OpenVPN. In this case, the user-space
- * daemon establishes OpenVPN connections to whatever detours it would like,
- * and reports these connections to the kernel. When a MPTCP connection looks
- * for a new subflow, it looks through the OpenVPN connection list and selects
- * one adapter.
+ * The second mechanism is via OpenVPN. In this case, the user-space daemon
+ * establishes OpenVPN connections to whatever detours it would like, and
+ * reports these connections to the kernel. When a MPTCP connection looks for a
+ * new subflow, it looks through the OpenVPN connection list and selects one
+ * adapter.
  */
 #include <linux/module.h>
 #include <linux/in.h>
@@ -78,7 +78,7 @@ struct vpn_entry {
  */
 struct detour_ns {
 	struct list_head priv_list;
-	struct mutex priv_list_lock;
+	spinlock_t priv_list_lock;
 	struct list_head entry_list;
 	struct mutex entry_list_lock;
 	struct list_head vpn_list;
@@ -167,11 +167,11 @@ static struct detour_entry *get_matching_detour(struct detour_ns *ns,
                                                 __be16 port)
 {
 	struct detour_entry *entry;
-	pr_debug("Finding matching detour for %pI4:%u\n", &s_addr, port);
+	pr_debug("Finding matching detour for %pI4:%u\n", &s_addr, ntohs(port));
 	mutex_lock(&ns->entry_list_lock);
 	list_for_each_entry(entry, &ns->entry_list, entry_list) {
 		pr_debug("Checking detour=%pI4:%u remote=%pI4:%u\n", &entry->dip,
-		         entry->rpt, &entry->rip, entry->rpt);
+		         ntohs(entry->rpt), &entry->rip, ntohs(entry->rpt));
 		if (entry->rip.s_addr == s_addr && entry->rpt == port) {
 			mutex_unlock(&ns->entry_list_lock);
 			pr_debug("yes\n");
@@ -287,7 +287,10 @@ next_subflow:
 	iter++;
 
 	if (sock_flag(meta_sk, SOCK_DEAD)) {
+		pr_debug("mptcp detour: socket dead, remove from priv list\n");
+		spin_lock(&detour_ns->priv_list_lock);
 		list_del(&pm_priv->priv_list);
+		spin_unlock(&detour_ns->priv_list_lock);
 		goto exit;
 	}
 
@@ -357,8 +360,6 @@ exit:
  */
 static void detour_new_session(const struct sock *meta_sk)
 {
-	struct net *net = sock_net(meta_sk);
-	struct detour_ns *ns = detour_get_ns(net);
 	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
 	struct detour_priv *fmp = (struct detour_priv *)&mpcb->mptcp_pm[0];
 
@@ -366,13 +367,14 @@ static void detour_new_session(const struct sock *meta_sk)
 	fmp->mpcb = mpcb;
 	fmp->detour_requested = false; // we will do this soon
 	fmp->next_id = 1;
-	list_add(&fmp->priv_list, &ns->priv_list);
 }
 
 static void detour_create_subflows(struct sock *meta_sk)
 {
 	const struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
 	struct detour_priv *pm_priv = (struct detour_priv *)&mpcb->mptcp_pm[0];
+	struct net *net = sock_net(meta_sk);
+	struct detour_ns *detour_ns = detour_get_ns(net);
 
 	if (mpcb->infinite_mapping_snd || mpcb->infinite_mapping_rcv ||
 	    mpcb->send_infinite_mapping || mpcb->server_side ||
@@ -383,6 +385,10 @@ static void detour_create_subflows(struct sock *meta_sk)
 		sock_hold(meta_sk);
 		queue_work(mptcp_wq, &pm_priv->subflow_work);
 	}
+
+	spin_lock(&detour_ns->priv_list_lock);
+	list_add(&pm_priv->priv_list, &detour_ns->priv_list);
+	spin_unlock(&detour_ns->priv_list_lock);
 }
 
 static int detour_get_local_id(sa_family_t family, union inet_addr *addr,
@@ -414,23 +420,32 @@ static int detour_echo(struct sk_buff *skb, struct genl_info *info)
 {
 	struct detour_entry *entry;
 	struct vpn_entry *vpn;
+	struct detour_priv *priv;
 	struct net *net = genl_info_net(info);
 	struct detour_ns *ns = detour_get_ns(net);
 
-	printk(KERN_INFO "mptcp DETOUR_ECHO: begin\n");
+	pr_debug("mptcp DETOUR_ECHO: begin\n");
 	mutex_lock(&ns->entry_list_lock);
 	list_for_each_entry(entry, &ns->entry_list, entry_list) {
-		printk(KERN_INFO "mptcp DETOUR_ECHO: detour=%pI4:%u remote=%pI4:%u\n",
-		       &entry->dip, entry->dpt, &entry->rip, entry->rpt);
+		pr_debug("mptcp DETOUR_ECHO: detour=%pI4:%u remote=%pI4:%u\n",
+		         &entry->dip, ntohs(entry->dpt), &entry->rip,
+		         ntohs(entry->rpt));
 	}
 	mutex_unlock(&ns->entry_list_lock);
 	mutex_lock(&ns->vpn_list_lock);
 	list_for_each_entry(vpn, &ns->vpn_list, vpn_list) {
-		printk(KERN_INFO "mptcp DETOUR_ECHO: vpn ifname=%s\n",
-		       vpn->ifname);
+		pr_debug("mptcp DETOUR_ECHO: vpn ifname=%s\n",
+		         vpn->ifname);
 	}
 	mutex_unlock(&ns->vpn_list_lock);
-	printk(KERN_INFO "mptcp DETOUR_ECHO: end\n");
+	spin_lock(&ns->priv_list_lock);
+	list_for_each_entry(priv, &ns->priv_list, priv_list) {
+		pr_debug("mptcp DETOUR_ECHO: priv pending=%d dead=%d\n",
+		         work_pending(&priv->subflow_work),
+		         sock_flag(priv->mpcb->meta_sk, SOCK_DEAD));
+	}
+	spin_unlock(&ns->priv_list_lock);
+	pr_debug("mptcp DETOUR_ECHO: end\n");
 
 	return 0;
 }
@@ -480,7 +495,7 @@ static int detour_add(struct sk_buff *skb, struct genl_info *info)
 		return -DETOUR_E_MISSING_ARG;
 	}
 
-	mutex_lock(&ns->priv_list_lock);
+	spin_lock(&ns->priv_list_lock);
 	list_for_each_entry(priv, &ns->priv_list, priv_list) {
 		// TODO check whether detour applies, THEN wake
 		if (!work_pending(&priv->subflow_work)) {
@@ -488,7 +503,7 @@ static int detour_add(struct sk_buff *skb, struct genl_info *info)
 			queue_work(mptcp_wq, &priv->subflow_work);
 		}
 	}
-	mutex_unlock(&ns->priv_list_lock);
+	spin_unlock(&ns->priv_list_lock);
 
 	return 0;
 }
@@ -580,7 +595,7 @@ static int mptcp_detour_init_net(struct net *net)
 		return -ENOBUFS;
 
 	mutex_init(&ns->entry_list_lock);
-	mutex_init(&ns->priv_list_lock);
+	spin_lock_init(&ns->priv_list_lock);
 	mutex_init(&ns->vpn_list_lock);
 	INIT_LIST_HEAD(&ns->entry_list);
 	INIT_LIST_HEAD(&ns->priv_list);
