@@ -48,7 +48,7 @@ struct detour_priv {
  * @dip, @dpt: detour ip and port (TODO IPv6 support)
  * @rip, @rpt: remote ip and port
  */
-struct detour_entry {
+struct nat_entry {
 	struct list_head entry_list;
 	struct in_addr dip;
 	__be16 dpt;
@@ -156,14 +156,12 @@ static struct detour_ns *detour_get_ns(const struct net *net)
 }
 
 /**
- * Search the entry_list for a detour that matches the given IP address and
- * port.
+ * Search the entry_list for a NAT that matches the given IP address and port.
  */
-static struct detour_entry *get_matching_detour(struct detour_ns *ns,
-                                                __be32 s_addr,
-                                                __be16 port)
+static struct nat_entry *choose_nat(struct detour_ns *ns, __be32 s_addr,
+                                    __be16 port)
 {
-	struct detour_entry *entry;
+	struct nat_entry *entry;
 	pr_debug("Finding matching detour for %pI4:%u\n", &s_addr, ntohs(port));
 	mutex_lock(&ns->entry_list_lock);
 	list_for_each_entry(entry, &ns->entry_list, entry_list) {
@@ -293,7 +291,7 @@ next_subflow:
 	if (num_subflows > iter && num_subflows > mpcb->cnt_subflows) {
 		if (meta_sk->sk_family == AF_INET ||
 		    mptcp_v6_is_v4_mapped(meta_sk)) {
-			struct detour_entry *detour;
+			struct nat_entry *detour;
 			struct net_device *dev = choose_vpn(detour_ns, net);
 			if (dev) {
 				struct mptcp_loc4 loc;
@@ -317,9 +315,9 @@ next_subflow:
 				goto next_subflow; // skip nat detour
 			}
 
-			detour = get_matching_detour(detour_ns,
-			                             inet_sk(meta_sk)->inet_daddr,
-			                             inet_sk(meta_sk)->inet_dport);
+			detour = choose_nat(detour_ns,
+			                    inet_sk(meta_sk)->inet_daddr,
+			                    inet_sk(meta_sk)->inet_dport);
 			if (detour) {
 				struct mptcp_loc4 loc;
 				struct mptcp_rem4 rem;
@@ -365,8 +363,6 @@ static void detour_create_subflows(struct sock *meta_sk)
 {
 	const struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
 	struct detour_priv *pm_priv = (struct detour_priv *)&mpcb->mptcp_pm[0];
-	struct net *net = sock_net(meta_sk);
-	struct detour_ns *detour_ns = detour_get_ns(net);
 
 	if (mpcb->infinite_mapping_snd || mpcb->infinite_mapping_rcv ||
 	    mpcb->send_infinite_mapping || mpcb->server_side ||
@@ -406,9 +402,8 @@ static struct mptcp_pm_ops detour __read_mostly = {
  */
 static int detour_echo(struct sk_buff *skb, struct genl_info *info)
 {
-	struct detour_entry *entry;
+	struct nat_entry *entry;
 	struct vpn_entry *vpn;
-	struct detour_priv *priv;
 	struct net *net = genl_info_net(info);
 	struct detour_ns *ns = detour_get_ns(net);
 
@@ -437,9 +432,8 @@ static int detour_echo(struct sk_buff *skb, struct genl_info *info)
  */
 static int detour_add(struct sk_buff *skb, struct genl_info *info)
 {
-	struct detour_entry *entry;
+	struct nat_entry *entry;
 	struct vpn_entry *vpn;
-	struct detour_priv *priv;
 	struct net *net = genl_info_net(info);
 	struct detour_ns *ns = detour_get_ns(net);
 
@@ -459,7 +453,7 @@ static int detour_add(struct sk_buff *skb, struct genl_info *info)
 	           info->attrs[DETOUR_A_REMOTE_IP] &&
 	           info->attrs[DETOUR_A_REMOTE_PORT]) {
 
-		entry = kmalloc(sizeof(struct detour_entry), GFP_KERNEL);
+		entry = kmalloc(sizeof(struct nat_entry), GFP_KERNEL);
 		if (!entry)
 			return -ENOMEM;
 
@@ -505,7 +499,7 @@ static int detour_del(struct sk_buff *skb, struct genl_info *info)
 	           info->attrs[DETOUR_A_DETOUR_PORT] &&
 	           info->attrs[DETOUR_A_REMOTE_IP] &&
 	           info->attrs[DETOUR_A_REMOTE_PORT]){
-		struct detour_entry *entry, *next;
+		struct nat_entry *entry, *next;
 		struct in_addr detour_ip, remote_ip;
 		__be16 detour_port, remote_port;
 
@@ -585,7 +579,7 @@ static int mptcp_detour_init_net(struct net *net)
  */
 static void mptcp_detour_exit_net(struct net *net)
 {
-	struct detour_entry *nat, *nat_tmp;
+	struct nat_entry *nat, *nat_tmp;
 	struct vpn_entry *vpn, *vpn_tmp;
 	struct detour_ns *ns = detour_get_ns(net);
 
