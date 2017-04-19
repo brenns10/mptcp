@@ -30,14 +30,23 @@
 /**
  * Path-manager specific data. Stored within struct mptcp_cb, so it is unique to
  * a specific MPTCP connection.
+ *
+ * NB: I have not found a reliable way to receive notification before an MPTCP
+ * connection socket is closed. As a result, DO NOT include anything here which
+ * must be cleaned up!
+ *
  * @subflow_work: used to enqueue the worker task
  * @mpcb: theoretically, we could get this with container_of
+ * @last_nat_jiffies: timestamp of the last NAT entry we considered
+ * @last_vpn_jiffies: timestamp of the last VPN entry we considered
  * @detour_requesed: have we advertised to user space that we want a detour?
  * @next_id: the id we will use for the next address
  */
 struct detour_priv {
 	struct work_struct subflow_work;
 	struct mptcp_cb *mpcb;
+	unsigned long last_nat_jiffies;
+	unsigned long last_vpn_jiffies;
 	bool detour_requested;
 	int next_id;
 };
@@ -45,11 +54,13 @@ struct detour_priv {
 /**
  * This struct contains a NAT detour record.
  * @entry_list: list head for entry_list
+ * @jiffies: timestamp from when we added this entry
  * @dip, @dpt: detour ip and port (TODO IPv6 support)
  * @rip, @rpt: remote ip and port
  */
 struct nat_entry {
 	struct list_head entry_list;
+	unsigned long jiffies;
 	struct in_addr dip;
 	__be16 dpt;
 	struct in_addr rip;
@@ -59,6 +70,7 @@ struct nat_entry {
 /**
  * Tests for equality of two NAT entries. There is much double evaluation in
  * this macro, so don't be stupid!
+ * Does not test for jiffies equality.
  */
 #define nat_entry_eq(e1, e2) (                                          \
 	(e1)->dip.s_addr == (e2)->dip.s_addr &&                         \
@@ -70,10 +82,12 @@ struct nat_entry {
 /**
  * This struct contains a VPN record. It's quite simple really.
  * @vpn_list: list head for vpn_list
+ * @jiffies: timestamp from when we added this entry
  * @ifname: name of interface (resolved at runtime)
  */
 struct vpn_entry {
 	struct list_head vpn_list;
+	unsigned long jiffies;
 	char ifname[IFNAMSIZ];
 };
 
@@ -170,21 +184,26 @@ static struct detour_ns *detour_get_ns(const struct net *net)
  * Search the entry_list for a NAT that matches the given IP address and port.
  */
 static struct nat_entry *choose_nat(struct detour_ns *ns, __be32 s_addr,
-                                    __be16 port)
+                                    __be16 port, unsigned long *jiffies)
 {
 	struct nat_entry *entry;
 	pr_debug("Finding matching detour for %pI4:%u\n", &s_addr, ntohs(port));
 	mutex_lock(&ns->entry_list_lock);
 	list_for_each_entry(entry, &ns->entry_list, entry_list) {
-		pr_debug("Checking detour=%pI4:%u remote=%pI4:%u\n", &entry->dip,
-		         ntohs(entry->rpt), &entry->rip, ntohs(entry->rpt));
+
+		/* if the entry is before or same as timestamp, ignore */
+		if (time_before_eq(entry->jiffies, *jiffies))
+			continue;
+
+		*jiffies = entry->jiffies;
+
 		if (entry->rip.s_addr == s_addr && entry->rpt == port) {
 			mutex_unlock(&ns->entry_list_lock);
-			pr_debug("yes\n");
-			// TODO move to end of list
+			pr_debug("choose nat detour=%pI4:%u remote=%pI4:%u\n",
+			         &entry->dip, ntohs(entry->rpt), &entry->rip,
+			         ntohs(entry->rpt));
 			return entry;
 		}
-		pr_debug("no\n");
 	}
 	mutex_unlock(&ns->entry_list_lock);
 	return NULL;
@@ -195,7 +214,8 @@ static struct nat_entry *choose_nat(struct detour_ns *ns, __be32 s_addr,
  * moves it to the end, and then returns it. That way we're always rotating
  * through vpns. Returns NULL if we have no vpn.
  */
-static struct net_device *choose_vpn(struct detour_ns *ns, struct net *net)
+static struct net_device *choose_vpn(struct detour_ns *ns, struct net *net,
+                                     unsigned long *jiffies)
 {
 	struct vpn_entry *vpn;
 	struct net_device *netdev;
@@ -205,24 +225,25 @@ static struct net_device *choose_vpn(struct detour_ns *ns, struct net *net)
 		return NULL;
 	}
 	list_for_each_entry(vpn, &ns->vpn_list, vpn_list) {
-		pr_debug("Searching for vpn iface=%s in netns...\n",
-		         vpn->ifname);
+
+		/* if the entry is before or same as timestamp, ignore */
+		if (time_before_eq(vpn->jiffies, *jiffies))
+			continue;
+
+		*jiffies = vpn->jiffies;
+
 		netdev = dev_get_by_name(net, vpn->ifname);
 		if (netdev) {
-			pr_debug("found vpn iface=%s with ifindex=%d\n",
+			mutex_unlock(&ns->vpn_list_lock);
+			pr_debug("choose vpn iface=%s with ifindex=%d\n",
 			         vpn->ifname, netdev->ifindex);
 			dev_put(netdev);
 			return netdev;
 		}
 	}
 	mutex_unlock(&ns->vpn_list_lock);
-
 	return NULL;
 }
-
-/**
- * Take an interface name and look up its if_idx.
- */
 
 /**
  * Requests a detour for our new mptcp session. This sends a netlink message
@@ -302,8 +323,23 @@ next_subflow:
 	if (num_subflows > iter && num_subflows > mpcb->cnt_subflows) {
 		if (meta_sk->sk_family == AF_INET ||
 		    mptcp_v6_is_v4_mapped(meta_sk)) {
+			/*
+			 * This portion of the code repeatedly calls choose_vpn
+			 * and, if that fails, choose_nat. These functions will
+			 * update the jiffies in our pm_priv struct, so that
+			 * each subsequent call considers more recently added
+			 * entries. Once we run out of VPN entries, the code
+			 * falls through to NAT entries. If the worker is
+			 * started a second time, it will only consider newly
+			 * added entries.
+			 *
+			 * Short of a much more detailed tracking of each
+			 * subflow and its assorted resources, this is the best
+			 * we can do.
+			 */
 			struct nat_entry *detour;
-			struct net_device *dev = choose_vpn(detour_ns, net);
+			struct net_device *dev = choose_vpn(detour_ns, net,
+			                                    &pm_priv->last_vpn_jiffies);
 			if (dev) {
 				struct mptcp_loc4 loc;
 				struct mptcp_rem4 rem;
@@ -313,7 +349,8 @@ next_subflow:
 				loc.addr.s_addr = inet_select_addr(
 					dev, inet_sk(meta_sk)->inet_daddr,
 					RT_SCOPE_UNIVERSE);
-				pr_debug("selected addr=%pI4\n", &loc.addr.s_addr);
+				pr_debug("vpn selected addr=%pI4\n",
+				         &loc.addr.s_addr);
 				loc.loc4_id = pm_priv->next_id++;
 				loc.low_prio = 0;
 				loc.if_idx = dev->ifindex;
@@ -322,13 +359,16 @@ next_subflow:
 				rem.port = inet_sk(meta_sk)->inet_dport;
 				rem.rem4_id = 0;
 
+				pm_priv->last_vpn_jiffies =
+
 				mptcp_init4_subsockets(meta_sk, &loc, &rem);
 				goto next_subflow; // skip nat detour
 			}
 
 			detour = choose_nat(detour_ns,
 			                    inet_sk(meta_sk)->inet_daddr,
-			                    inet_sk(meta_sk)->inet_dport);
+			                    inet_sk(meta_sk)->inet_dport,
+			                    &pm_priv->last_nat_jiffies);
 			if (detour) {
 				struct mptcp_loc4 loc;
 				struct mptcp_rem4 rem;
@@ -338,7 +378,6 @@ next_subflow:
 				loc.low_prio = 0;
 				loc.if_idx = 0;
 
-				// hack hack hack
 				rem.addr.s_addr = detour->dip.s_addr;
 				rem.port = detour->dpt;
 				rem.rem4_id = 0;
@@ -368,6 +407,8 @@ static void detour_new_session(const struct sock *meta_sk)
 	fmp->mpcb = mpcb;
 	fmp->detour_requested = false; // we will do this soon
 	fmp->next_id = 1;
+	fmp->last_nat_jiffies = 0;
+	fmp->last_vpn_jiffies = 0;
 }
 
 static void detour_create_subflows(struct sock *meta_sk)
@@ -437,6 +478,69 @@ static int detour_echo(struct sk_buff *skb, struct genl_info *info)
 	return 0;
 }
 
+/**
+ * Enqueue the create_subflow_worker again for any MPTCP socket which may be
+ * interested in a new entry. If nat argument is NULL, wakes all workers in the
+ * netns. Otherwise, wakes only those which could use the NAT entry.
+ */
+static void wake_relevant_workers(struct net *net, struct nat_entry *nat)
+{
+	struct mptcp_cb *mpcb;
+	struct tcp_sock *meta_tp;
+	const struct hlist_nulls_node *node;
+	int i;
+
+	for (i = 0; i < MPTCP_HASH_SIZE; i++) {
+		rcu_read_lock_bh();
+		hlist_nulls_for_each_entry_rcu(meta_tp, node, &tk_hashtable[i],
+		                               tk_table) {
+			struct sock *meta_sk = (struct sock *)meta_tp;
+			mpcb = meta_tp->mpcb;
+
+			if (sock_net(meta_sk) != net)
+				continue;
+
+			if (unlikely(!atomic_inc_not_zero(&meta_sk->sk_refcnt)))
+				continue;
+
+			bh_lock_sock(meta_sk);
+
+			if (!mptcp(meta_tp) || !is_meta_sk(meta_sk) ||
+			    mpcb->infinite_mapping_snd ||
+			    mpcb->infinite_mapping_rcv ||
+			    mpcb->send_infinite_mapping)
+				goto next;
+
+			if (mpcb->pm_ops != &detour)
+				goto next;
+
+			if (!nat) {
+				/* when no entry provided, wake all */
+				pr_debug("waking a MPTCP connection");
+				detour_create_subflows(meta_sk);
+			} else if (meta_sk->sk_family == AF_INET ||
+			           mptcp_v6_is_v4_mapped(meta_sk)) {
+				/* only wake socket relevant to entry */
+				struct in_addr addr;
+				__be16 port;
+				addr.s_addr = inet_sk(meta_sk)->inet_daddr;
+				port = inet_sk(meta_sk)->inet_dport;
+				if (addr.s_addr == nat->rip.s_addr &&
+				    port == nat->rpt) {
+					pr_debug("waking a MPTCP connection");
+					detour_create_subflows(meta_sk);
+				}
+
+			}
+
+		next:
+			bh_unlock_sock(meta_sk);
+			sock_put(meta_sk);
+		}
+		rcu_read_unlock_bh();
+	}
+}
+
 /*
  * Function which receives netlink messages and adds detour routes to our list
  * of available ones.
@@ -455,6 +559,7 @@ static int detour_add(struct sk_buff *skb, struct genl_info *info)
 
 		nla_strlcpy(vpn->ifname, info->attrs[DETOUR_A_IFNAME], IFNAMSIZ);
 
+
 		/* Only add unique VPN entries. */
 		mutex_lock(&ns->vpn_list_lock);
 		list_for_each_entry(vpn_iter, &ns->vpn_list, vpn_list) {
@@ -468,7 +573,9 @@ static int detour_add(struct sk_buff *skb, struct genl_info *info)
 
 		pr_debug("Adding \"%s\" to the entry list.\n", vpn->ifname);
 		list_add_tail(&vpn->vpn_list, &ns->vpn_list);
+		vpn->jiffies = jiffies; // last thing before release
 		mutex_unlock(&ns->vpn_list_lock);
+		wake_relevant_workers(net, NULL);
 	} else if (info->attrs[DETOUR_A_DETOUR_IP] &&
 	           info->attrs[DETOUR_A_DETOUR_PORT] &&
 	           info->attrs[DETOUR_A_REMOTE_IP] &&
@@ -496,15 +603,12 @@ static int detour_add(struct sk_buff *skb, struct genl_info *info)
 
 		pr_debug("Adding a detour to the entry list.\n");
 		list_add_tail(&entry->entry_list, &ns->entry_list);
+		entry->jiffies = jiffies; // last thing before release
 		mutex_unlock(&ns->entry_list_lock);
+		wake_relevant_workers(net, entry);
 	} else {
 		return -DETOUR_E_MISSING_ARG;
 	}
-
-	// TODO: (next commit), rather than wake every queue, simply iterate
-	// over every MPTCP socket in the netns and apply it to all that can use
-	// it. This is a heavy operation, but in the system call context, the
-	// processes should be aware that this could happen.
 	return 0;
 }
 
