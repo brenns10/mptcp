@@ -57,6 +57,17 @@ struct nat_entry {
 };
 
 /**
+ * Tests for equality of two NAT entries. There is much double evaluation in
+ * this macro, so don't be stupid!
+ */
+#define nat_entry_eq(e1, e2) (                                          \
+	(e1)->dip.s_addr == (e2)->dip.s_addr &&                         \
+	(e1)->dpt == (e2)->dpt &&                                       \
+	(e1)->rip.s_addr == (e2)->rip.s_addr &&                         \
+	(e1)->rpt == (e2)->rpt                                          \
+		)
+
+/**
  * This struct contains a VPN record. It's quite simple really.
  * @vpn_list: list head for vpn_list
  * @ifname: name of interface (resolved at runtime)
@@ -432,8 +443,8 @@ static int detour_echo(struct sk_buff *skb, struct genl_info *info)
  */
 static int detour_add(struct sk_buff *skb, struct genl_info *info)
 {
-	struct nat_entry *entry;
-	struct vpn_entry *vpn;
+	struct nat_entry *entry, *nat_iter;
+	struct vpn_entry *vpn, *vpn_iter;
 	struct net *net = genl_info_net(info);
 	struct detour_ns *ns = detour_get_ns(net);
 
@@ -444,9 +455,19 @@ static int detour_add(struct sk_buff *skb, struct genl_info *info)
 
 		nla_strlcpy(vpn->ifname, info->attrs[DETOUR_A_IFNAME], IFNAMSIZ);
 
-		pr_debug("Adding \"%s\" to the entry list.\n", vpn->ifname);
+		/* Only add unique VPN entries. */
 		mutex_lock(&ns->vpn_list_lock);
-		list_add(&vpn->vpn_list, &ns->vpn_list);
+		list_for_each_entry(vpn_iter, &ns->vpn_list, vpn_list) {
+			if (nla_strcmp(info->attrs[DETOUR_A_IFNAME], vpn_iter->ifname) == 0) {
+				kfree(vpn);
+				mutex_unlock(&ns->vpn_list_lock);
+				pr_debug("mptcp detour: duplicate vpn, ignoring\n");
+				return 0;
+			}
+		}
+
+		pr_debug("Adding \"%s\" to the entry list.\n", vpn->ifname);
+		list_add_tail(&vpn->vpn_list, &ns->vpn_list);
 		mutex_unlock(&ns->vpn_list_lock);
 	} else if (info->attrs[DETOUR_A_DETOUR_IP] &&
 	           info->attrs[DETOUR_A_DETOUR_PORT] &&
@@ -462,9 +483,19 @@ static int detour_add(struct sk_buff *skb, struct genl_info *info)
 		entry->dpt = nla_get_be16(info->attrs[DETOUR_A_DETOUR_PORT]);
 		entry->rpt = nla_get_be16(info->attrs[DETOUR_A_REMOTE_PORT]);
 
-		pr_debug("Adding a detour to the entry list.\n");
+		/* Only add unique NAT entries. */
 		mutex_lock(&ns->entry_list_lock);
-		list_add(&entry->entry_list, &ns->entry_list);
+		list_for_each_entry(nat_iter, &ns->entry_list, entry_list) {
+			if (nat_entry_eq(nat_iter, entry)) {
+				kfree(entry);
+				mutex_unlock(&ns->entry_list_lock);
+				pr_debug("mptcp detour: duplicate nat, ignoring\n");
+				return 0;
+			}
+		}
+
+		pr_debug("Adding a detour to the entry list.\n");
+		list_add_tail(&entry->entry_list, &ns->entry_list);
 		mutex_unlock(&ns->entry_list_lock);
 	} else {
 		return -DETOUR_E_MISSING_ARG;
@@ -477,8 +508,9 @@ static int detour_add(struct sk_buff *skb, struct genl_info *info)
 	return 0;
 }
 
-/*
- * Function for deleting detour routes from our list.
+/**
+ * Function for deleting detour routes from our list. Called via netlink from
+ * userspace. Does not close any subflows over the detour.
  */
 static int detour_del(struct sk_buff *skb, struct genl_info *info)
 {
@@ -500,20 +532,16 @@ static int detour_del(struct sk_buff *skb, struct genl_info *info)
 	           info->attrs[DETOUR_A_REMOTE_IP] &&
 	           info->attrs[DETOUR_A_REMOTE_PORT]){
 		struct nat_entry *entry, *next;
-		struct in_addr detour_ip, remote_ip;
-		__be16 detour_port, remote_port;
+		struct nat_entry del;
 
-		detour_ip.s_addr = nla_get_in_addr(info->attrs[DETOUR_A_DETOUR_IP]);
-		remote_ip.s_addr = nla_get_in_addr(info->attrs[DETOUR_A_REMOTE_IP]);
-		detour_port = nla_get_be16(info->attrs[DETOUR_A_DETOUR_PORT]);
-		remote_port = nla_get_be16(info->attrs[DETOUR_A_REMOTE_PORT]);
+		del.dip.s_addr = nla_get_in_addr(info->attrs[DETOUR_A_DETOUR_IP]);
+		del.rip.s_addr = nla_get_in_addr(info->attrs[DETOUR_A_REMOTE_IP]);
+		del.dpt = nla_get_be16(info->attrs[DETOUR_A_DETOUR_PORT]);
+		del.rpt = nla_get_be16(info->attrs[DETOUR_A_REMOTE_PORT]);
 
 		mutex_lock(&ns->entry_list_lock);
 		list_for_each_entry_safe(entry, next, &ns->entry_list, entry_list) {
-			if (entry->dip.s_addr == detour_ip.s_addr &&
-			    entry->dpt == detour_port &&
-			    entry->rip.s_addr == remote_ip.s_addr &&
-			    entry->rpt == remote_port)
+			if (nat_entry_eq(entry, &del))
 				list_del(&entry->entry_list);
 		}
 		mutex_unlock(&ns->entry_list_lock);
